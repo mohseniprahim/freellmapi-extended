@@ -18,7 +18,8 @@ RUN npm install
 
 # Build server (tsc -> server/dist) and client (vite -> client/dist).
 COPY . .
-RUN npm run build
+ARG VITE_BASE=/
+RUN VITE_BASE="$VITE_BASE" npm run build
 
 # ---------- runtime ----------
 # Same base image so the compiled better-sqlite3 binary is ABI-compatible.
