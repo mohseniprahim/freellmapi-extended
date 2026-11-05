@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { usePlaygroundApiKey } from './playground/usePlaygroundApiKey'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
@@ -61,11 +62,7 @@ export default function PlaygroundPage() {
   const [selectedModel, setSelectedModel] = useState<string>('auto')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-
-  const { data: keyData } = useQuery<{ apiKey: string }>({
-    queryKey: ['unified-key'],
-    queryFn: () => apiFetch('/api/settings/api-key'),
-  })
+  const apiKey = usePlaygroundApiKey()
 
   const { data: fallbackEntries = [] } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -91,7 +88,7 @@ export default function PlaygroundPage() {
 
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
 
       const body: any = {
         messages: newMessages.map(m => ({ role: m.role, content: m.content })),

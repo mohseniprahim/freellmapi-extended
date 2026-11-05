@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
+import { usePlaygroundApiKey } from './usePlaygroundApiKey'
 
 type Mode = 'inpaint' | 'outpaint'
 type OutDir = 'left' | 'right' | 'top' | 'bottom' | 'all'
@@ -50,10 +49,7 @@ export default function ImageEditPanel() {
   const [result, setResult] = useState<ResultBlock | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const { data: keyData } = useQuery<{ apiKey: string }>({
-    queryKey: ['unified-key'],
-    queryFn: () => apiFetch('/api/settings/api-key'),
-  })
+  const apiKey = usePlaygroundApiKey()
 
   // Reset mask when source or mode changes
   useEffect(() => {
@@ -208,7 +204,7 @@ export default function ImageEditPanel() {
     setLoading(true)
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
       const base = import.meta.env.BASE_URL.replace(/\/$/, '')
       const img = getImageDataUrl()!
       const start = Date.now()

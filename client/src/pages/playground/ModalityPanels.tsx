@@ -2,24 +2,15 @@
  * Playground panels for the non-chat / non-image-edit modalities:
  * image generation, text-to-speech, speech-to-text, embeddings, rerank.
  *
- * Each panel is self-contained: it fetches the unified key, posts to the
+ * Each panel is self-contained: it fetches the default client key, posts to the
  * matching /v1/* endpoint and renders the result. Styling matches the rest
  * of the dashboard — rounded card surfaces, teal accent, caption + value
  * typography.
  */
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
-
-function useApiKey() {
-  const { data } = useQuery<{ apiKey: string }>({
-    queryKey: ['unified-key'],
-    queryFn: () => apiFetch('/api/settings/api-key'),
-  })
-  return data?.apiKey
-}
+import { usePlaygroundApiKey } from './usePlaygroundApiKey'
 
 function apiBase() {
   return import.meta.env.BASE_URL.replace(/\/$/, '')
@@ -73,7 +64,7 @@ function RoutedBadge({ via }: { via?: string }) {
 // Image generation — POST /v1/images/generations
 // ──────────────────────────────────────────────────────────────────────
 export function ImageGenPanel() {
-  const key = useApiKey()
+  const key = usePlaygroundApiKey()
   const [prompt, setPrompt] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -135,7 +126,7 @@ export function ImageGenPanel() {
 const TTS_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
 
 export function TtsPanel() {
-  const key = useApiKey()
+  const key = usePlaygroundApiKey()
   const [text, setText] = useState('')
   const [voice, setVoice] = useState('alloy')
   const [loading, setLoading] = useState(false)
@@ -198,7 +189,7 @@ export function TtsPanel() {
 // Speech-to-text — POST /v1/audio/transcriptions (JSON, data-url audio)
 // ──────────────────────────────────────────────────────────────────────
 export function SttPanel() {
-  const key = useApiKey()
+  const key = usePlaygroundApiKey()
   const [fileName, setFileName] = useState('')
   const [dataUrl, setDataUrl] = useState<string>()
   const [loading, setLoading] = useState(false)
@@ -258,7 +249,7 @@ export function SttPanel() {
 // Embeddings — POST /v1/embeddings
 // ──────────────────────────────────────────────────────────────────────
 export function EmbeddingPanel() {
-  const key = useApiKey()
+  const key = usePlaygroundApiKey()
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -315,7 +306,7 @@ export function EmbeddingPanel() {
 // Rerank — POST /v1/rerank
 // ──────────────────────────────────────────────────────────────────────
 export function RerankPanel() {
-  const key = useApiKey()
+  const key = usePlaygroundApiKey()
   const [query, setQuery] = useState('')
   const [docs, setDocs] = useState('')
   const [loading, setLoading] = useState(false)
