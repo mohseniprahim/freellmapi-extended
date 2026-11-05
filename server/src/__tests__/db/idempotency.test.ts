@@ -8,6 +8,23 @@ import { initDb } from '../../db/index.js';
  * (V10+) should be added to this test as they ship.
  */
 describe('Migration idempotency', () => {
+  it('V46 does not collide with an existing id=1 row after unified key rotation', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/freeapi-v46-id1-${Date.now()}.db`;
+    const db1 = initDb(tmpPath);
+    const original = db1.prepare('SELECT key_hash FROM client_keys WHERE id = 1').get() as
+      { key_hash: string };
+    db1.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'")
+      .run(`rotated-unified-key-${Date.now()}`);
+    db1.close();
+
+    const db2 = initDb(tmpPath);
+    const rows = db2.prepare('SELECT id, key_hash FROM client_keys ORDER BY id').all() as
+      Array<{ id: number; key_hash: string }>;
+    expect(rows).toEqual([{ id: 1, key_hash: original.key_hash }]);
+    db2.close();
+  });
+
   it('initDb on a fresh in-memory DB then re-run produces identical row counts', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     // Use a single shared file so both inits hit the same DB.

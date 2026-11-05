@@ -2552,6 +2552,10 @@ function migrateClientKeysV46SeedGeneral(db: Database.Database) {
   const hash = crypto.createHash('sha256').update(existing.value).digest('hex');
   const already = db.prepare('SELECT id FROM client_keys WHERE key_hash = ?').get(hash) as { id: number } | undefined;
   if (already) return;
+  // id=1 may already hold a separately managed client key. The legacy unified
+  // setting can rotate independently, so never collide with or replace that row.
+  const defaultRow = db.prepare('SELECT id FROM client_keys WHERE id = 1').get() as { id: number } | undefined;
+  if (defaultRow) return;
   const prefix = existing.value.slice(0, 16);
   db.prepare(`
     INSERT INTO client_keys (id, name, key_hash, key_prefix, enabled)
