@@ -116,6 +116,11 @@ export function initDb(dbPath?: string): Database.Database {
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
 
+  // Older deployments regenerated settings.unified_api_key without updating
+  // client_keys. Backfill the current value once per missing hash so existing
+  // users recover without rotating their key or losing any database rows.
+  ensureUnifiedKeyClientKey(db);
+
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
 }
@@ -2491,6 +2496,31 @@ export function getUnifiedApiKey(): string {
   const db = getDb();
   const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
   return row.value;
+}
+
+export function ensureUnifiedKeyClientKey(db: Database.Database = getDb()): void {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as
+    { value: string } | undefined;
+  if (!row?.value) return;
+
+  const hash = crypto.createHash('sha256').update(row.value).digest('hex');
+  const existing = db.prepare('SELECT id FROM client_keys WHERE key_hash = ?').get(hash);
+  if (existing) return;
+
+  let encrypted: string | null = null;
+  let iv: string | null = null;
+  let authTag: string | null = null;
+  try {
+    const enc = encrypt(row.value);
+    encrypted = enc.encrypted;
+    iv = enc.iv;
+    authTag = enc.authTag;
+  } catch { /* /v1 authentication uses the hash; reveal can remain unavailable */ }
+
+  db.prepare(`
+    INSERT INTO client_keys (name, key_hash, key_prefix, enabled, encrypted_key, iv, auth_tag)
+    VALUES ('Unified API key', ?, ?, 1, ?, ?, ?)
+  `).run(hash, row.value.slice(0, 16), encrypted, iv, authTag);
 }
 
 export function regenerateUnifiedKey(): string {

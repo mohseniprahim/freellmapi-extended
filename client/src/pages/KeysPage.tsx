@@ -112,6 +112,12 @@ function UnifiedKeySection() {
         </Button>
       </div>
 
+      {regenerate.isError && (
+        <p className="mt-2 text-xs text-destructive" role="alert">
+          تعذر تجديد المفتاح: {regenerate.error.message}
+        </p>
+      )}
+
       <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
         <span className="text-muted-foreground">Base URL</span>
         <code className="font-mono">{baseUrl}</code>

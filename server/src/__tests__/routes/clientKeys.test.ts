@@ -9,6 +9,7 @@ import {
   regenerateUnifiedKey,
   authenticateApiKey,
   revealClientKey,
+  ensureUnifiedKeyClientKey,
 } from '../../db/index.js';
 
 async function req(app: Express, method: string, path: string, body?: any) {
@@ -153,5 +154,44 @@ describe('Client Keys CRUD', () => {
     expect(authenticateApiKey(regenerated)).toEqual({ id: unifiedRow!.id, name: 'Unified API key' });
     expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
     expect(revealClientKey(unifiedRow!.id)).toBe(regenerated);
+  });
+
+  it('backfills the current unified key without rotating it or overwriting Default', () => {
+    const db = getDb();
+    const unified = getUnifiedApiKey();
+    const unifiedHash = createHash('sha256').update(unified).digest('hex');
+    const defaultRow = db.prepare('SELECT key_hash, key_prefix FROM client_keys WHERE id = 1').get() as
+      { key_hash: string; key_prefix: string };
+    const separateDefault = `myllm-${'b'.repeat(48)}`;
+    const separateHash = createHash('sha256').update(separateDefault).digest('hex');
+
+    db.prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
+      .run(separateHash, separateDefault.slice(0, 16));
+    try {
+      ensureUnifiedKeyClientKey(db);
+
+      const mapped = db.prepare('SELECT id, name FROM client_keys WHERE key_hash = ?').get(unifiedHash) as
+        { id: number; name: string } | undefined;
+      expect(mapped).toBeDefined();
+      expect(mapped?.id).not.toBe(1);
+      expect(mapped?.name).toBe('Unified API key');
+      expect(authenticateApiKey(unified)).toEqual({ id: mapped!.id, name: 'Unified API key' });
+
+      ensureUnifiedKeyClientKey(db);
+      expect(db.prepare('SELECT COUNT(*) AS count FROM client_keys WHERE key_hash = ?').get(unifiedHash))
+        .toEqual({ count: 1 });
+      expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
+    } finally {
+      db.prepare('DELETE FROM client_keys WHERE key_hash = ?').run(unifiedHash);
+      db.prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
+        .run(defaultRow.key_hash, defaultRow.key_prefix);
+    }
+  });
+
+  it('POST regenerate endpoint persists a /v1-authenticating key', async () => {
+    const response = await req(app, 'POST', '/api/settings/api-key/regenerate');
+    expect(response.status).toBe(200);
+    expect(response.body.apiKey).toMatch(/^myllm-[0-9a-f]{48}$/);
+    expect(authenticateApiKey(response.body.apiKey)).not.toBeNull();
   });
 });
