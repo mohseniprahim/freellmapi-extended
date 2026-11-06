@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import type { ChatMessage, ChatCompletionResponse, ChatContentPart } from '@myllm/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, setKeyCooldown, classifyError } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, setKeyCooldown, classifyError, isKeyWideError, isClientFault } from '../services/ratelimit.js';
 import { getDb } from '../db/index.js';
 import { clientCtx } from './clientAuth.js';
 import { computeCostMicro } from './pricing.js';
@@ -12,7 +12,7 @@ import { redactSecrets } from './redact.js';
 // average cascade depth ~5 attempts before success; 20 just buys log spam
 // and ~30s extra latency when the entire fallback chain is rate-limited.
 // 8 covers the common saturation case without prolonging dead requests.
-const MAX_RETRIES = 8;
+export const MAX_CHAT_ATTEMPTS = 8;
 
 // ---- Schema (shared with HTTP proxy) ----
 
@@ -121,11 +121,10 @@ export const chatCompletionSchema = z.object({
   tool_choice: toolChoiceSchema.optional(),
   parallel_tool_calls: z.boolean().optional(),
   response_format: responseFormatSchema.optional(),
-  // Caller opt-in to include reasoning-trace models in auto-route.
-  // Default: false — reasoning models burn the max_tokens budget on a thinking
-  // trace and frequently return content:null with finish_reason=length, which
-  // breaks callers expecting an answer. Explicit `model="..."` pins still
-  // bypass this gate.
+  // true: include reasoning normally; false: never use it in Auto/aliases.
+  // Omitted: prefer answer models, allow reasoning only as last-resort fallback.
+  // No schema default: omission MUST stay distinct from explicit false.
+  // Real model pins still bypass this gate (aliases are not real pins).
   extra: z.object({
     allow_reasoning: z.boolean().optional(),
   }).optional(),
@@ -149,10 +148,13 @@ export type ChatCompletionRequest = z.infer<typeof chatCompletionSchema>;
 
 export function isRetryableError(err: any): boolean {
   const msg = (err?.message ?? '').toLowerCase();
+  if (isClientFault(msg)) return false;
+  const reason = classifyError(msg);
+  if (reason === 'invalid_key' || reason === 'rate_limit_day' || reason === 'model_gone') return true;
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
-    || msg.includes('econnrefused') || msg.includes('econnreset')
+    || msg.includes('econnrefused') || msg.includes('econnreset') || msg.includes('fetch failed')
     // undici throws bare "terminated" / "other side closed" when an upstream
     // SSE connection drops mid-flight (common with NVIDIA on long streams).
     // Retryable so a pre-first-chunk drop cascades to the next key/model.
@@ -194,6 +196,32 @@ export function isModelLevelFailure(err: any): boolean {
     || msg.includes('terminated') || msg.includes('other side closed')
     || msg.includes('fetch failed') || msg.includes('econnreset')
     || msg.includes('econnrefused') || msg.includes('socket hang');
+}
+
+/** One failure scope policy for sync and pre-first-chunk streaming retries. */
+export function applyChatFailure(route: RouteResult, err: Error, skipKeys: Set<string>, skipModels: Set<number>) {
+  const reason = classifyError(err.message);
+  if (isKeyWideError(err.message)) {
+    // Request-local wildcard also works if persisting a cooldown fails.
+    skipKeys.add(`${route.platform}:*:${route.keyId}`);
+    setKeyCooldown(route.platform, route.keyId, reason);
+  } else if (isModelLevelFailure(err) || reason === 'model_gone') {
+    skipModels.add(route.modelDbId);
+    setCooldown(route.platform, route.modelId, route.keyId, reason);
+  } else {
+    skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+    setCooldown(route.platform, route.modelId, route.keyId, reason);
+  }
+  recordRateLimitHit(route.modelDbId);
+  return reason;
+}
+
+export function chatReasoningPolicy(parsed: ChatCompletionRequest, realPin: boolean, requireJsonMode: boolean) {
+  return {
+    excludeReasoning: !realPin && parsed.extra?.allow_reasoning !== true,
+    allowReasoningFallback: !realPin && !requireJsonMode && !parsed.no_cascade
+      && parsed.extra?.allow_reasoning === undefined,
+  };
 }
 
 // ---- Sticky session (multi-turn affinity) ----
@@ -590,14 +618,6 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
   // Per-request id (lightweight; collisions in DB index OK). Lets us join
   // multiple cascade-attempt rows for the same incoming call when diagnosing.
   const reqId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  // Reasoning models burn the max_tokens budget on a thinking trace and
-  // often return content:null with finish_reason=length. For auto-route we
-  // exclude them by default. Caller can opt in with extra.allow_reasoning,
-  // OR pin a reasoning model explicitly via `model="..."` — pinned id always
-  // wins. JSON-mode requests already exclude reasoning (via supports_json_mode
-  // gate); the explicit excludeReasoning flag covers the plain-text auto-route.
-  const excludeReasoning = !parsed.extra?.allow_reasoning && !requestedModel;
-
   // Fixed alias chains (`coding`, `askpusulasi`, ...) — a reorder-proof,
   // priority model list. coding stays inside NVIDIA+Cerebras; askpusulasi is a
   // vision-first fast chain that cascades to the full catalog. See resolveAlias.
@@ -610,25 +630,37 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
   const preferredModel = alias
     ? undefined
     : resolvePreferredModel(requestedModel, messages, requireVision, requireJsonMode);
+  const { excludeReasoning, allowReasoningFallback } = chatReasoningPolicy(
+    parsed, !!requestedModel && !alias && preferredModel !== undefined, requireJsonMode,
+  );
+  if (parsed.no_cascade && requestedModel && !alias && preferredModel === undefined) {
+    throw new RoutingError('Pinned model does not support the requested features.', 400);
+  }
 
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
+  const platformAttempts = new Map<string, number>();
   let lastError: Error | null = null;
 
   // no_cascade (health probe): only ever try the single resolved route so the
   // caller sees the pinned model's true error instead of a cascade endpoint.
-  const maxRetries = parsed.no_cascade ? 1 : MAX_RETRIES;
+  const maxRetries = parsed.no_cascade ? 1 : MAX_CHAT_ATTEMPTS;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requireVision, requireJsonMode, excludeReasoning, 'text', undefined, aliasChain, aliasPlatforms, skipModels.size > 0 ? skipModels : undefined);
+      route = routeRequest(estimatedTotal, skipKeys, preferredModel, requireVision, requireJsonMode, excludeReasoning, 'text', undefined, aliasChain, aliasPlatforms, skipModels, {
+        platformAttempts, allowReasoningFallback,
+        preferReasoningFallback: allowReasoningFallback && attempt === maxRetries - 1,
+        strictModelDbId: parsed.no_cascade && requestedModel && !alias ? preferredModel : undefined,
+      });
     } catch (err: any) {
       if (lastError) throw new AllProvidersFailedError(lastError.message);
       throw new RoutingError(err.message, err.status ?? 503);
     }
 
     recordRequest(route.platform, route.modelId, route.keyId);
+    platformAttempts.set(route.platform, (platformAttempts.get(route.platform) ?? 0) + 1);
 
     try {
       // Frontier models (intelligence rank ≤ 8 — the 480B/253B-class) take
@@ -691,41 +723,21 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
       });
 
       if (isRetryableError(err)) {
-        const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
-        const reason = classifyError(err.message);
-        if (isModelLevelFailure(err) || reason === 'model_gone') {
-          // Endpoint hung/unreachable, OR the model id no longer resolves to a
-          // serving endpoint (model_gone) — skip the WHOLE model for this
-          // request. Retrying its other keys just burns another full timeout /
-          // re-404s. model_gone also writes a 6h cooldown so it stops being
-          // tried at all until it (maybe) comes back.
-          skipModels.add(route.modelDbId);
-          setCooldown(route.platform, route.modelId, route.keyId, reason);
-        } else if (reason === 'invalid_key' || reason === 'rate_limit_day') {
-          // Account-level errors lock the ENTIRE key, not just this model.
-          skipKeys.add(skipId);
-          setKeyCooldown(route.platform, route.keyId, reason);
-        } else {
-          // Minute-burst / unknown stay per-model+key (a different model_id
-          // on the same key may still work).
-          skipKeys.add(skipId);
-          setCooldown(route.platform, route.modelId, route.keyId, reason);
-        }
-        recordRateLimitHit(route.modelDbId);
+        const reason = applyChatFailure(route, err, skipKeys, skipModels);
         lastError = err;
         // Health probe: surface the pinned model's real error, do not cascade.
         if (parsed.no_cascade) throw new ProviderFatalError(route.displayName, err);
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName} (${reason}), falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${redactSecrets(err.message)?.slice(0, 60)} from ${route.displayName} (${reason}), falling back (attempt ${attempt + 1}/${maxRetries})`);
         continue;
       }
 
       // Provider-specific 400/422 — skip THIS model and keep cascading so one
       // quirky endpoint can't sink the request (unless this is a no_cascade probe).
-      if (isBadRequestError(err) && !parsed.no_cascade) {
+      if (isBadRequestError(err) && !isClientFault(err.message) && !parsed.no_cascade) {
         skipModels.add(route.modelDbId);
         setCooldown(route.platform, route.modelId, route.keyId, 'rate_limit_unknown');
         lastError = err;
-        console.log(`[Proxy] 400/422 from ${route.displayName}, skipping model and cascading (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] 400/422 from ${route.displayName}, skipping model and cascading (attempt ${attempt + 1}/${maxRetries})`);
         continue;
       }
 

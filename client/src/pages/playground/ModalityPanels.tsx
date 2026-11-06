@@ -2,7 +2,7 @@
  * Playground panels for the non-chat / non-image-edit modalities:
  * image generation, text-to-speech, speech-to-text, embeddings, rerank.
  *
- * Each panel is self-contained: it fetches the default client key, posts to the
+ * Each panel is self-contained: it fetches the unified API key, posts to the
  * matching /v1/* endpoint and renders the result. Styling matches the rest
  * of the dashboard — rounded card surfaces, teal accent, caption + value
  * typography.
@@ -10,16 +10,15 @@
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
-import { usePlaygroundApiKey } from './usePlaygroundApiKey'
+import { assertApiSession, readApiJson } from '@/lib/api'
+import { API_KEY_MISSING_MESSAGE, usePlaygroundApiKey } from './usePlaygroundApiKey'
 
 function apiBase() {
   return import.meta.env.BASE_URL.replace(/\/$/, '')
 }
 
-function authHeaders(key?: string): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (key) h['Authorization'] = `Bearer ${key}`
-  return h
+function authHeaders(key: string): Record<string, string> {
+  return { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }
 }
 
 function fileToDataUrl(file: File): Promise<string> {
@@ -45,7 +44,7 @@ function PanelShell({ title, hint, children }: { title: string; hint: string; ch
 
 function ErrorBox({ msg }: { msg: string }) {
   return (
-    <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+    <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
       {msg}
     </div>
   )
@@ -64,7 +63,7 @@ function RoutedBadge({ via }: { via?: string }) {
 // Image generation — POST /v1/images/generations
 // ──────────────────────────────────────────────────────────────────────
 export function ImageGenPanel() {
-  const key = usePlaygroundApiKey()
+  const { apiKey: key, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
   const [prompt, setPrompt] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -72,6 +71,7 @@ export function ImageGenPanel() {
   const [via, setVia] = useState<string>()
 
   async function run() {
+    if (!isReady || !key) { setError(keyMessage ?? API_KEY_MISSING_MESSAGE); return }
     if (!prompt.trim() || loading) return
     setLoading(true); setError(''); setImages([]); setVia(undefined)
     try {
@@ -80,8 +80,7 @@ export function ImageGenPanel() {
         body: JSON.stringify({ prompt: prompt.trim(), n: 1, response_format: 'b64_json' }),
       })
       setVia(res.headers.get('X-Routed-Via') ?? undefined)
-      const data = await res.json()
-      if (!res.ok) { setError(data.error?.message ?? `HTTP ${res.status}`); return }
+      const data = await readApiJson<any>(res)
       const imgs = (data.data ?? [])
         .map((d: any) => d.b64_json ? `data:image/png;base64,${d.b64_json}` : d.url)
         .filter(Boolean)
@@ -103,12 +102,12 @@ export function ImageGenPanel() {
         />
       </div>
       <div className="flex items-center gap-3">
-        <Button onClick={run} disabled={loading || !prompt.trim()} size="sm">
+        <Button onClick={run} disabled={!isReady || loading || !prompt.trim()} size="sm">
           {loading ? 'Generating…' : 'Generate'}
         </Button>
         <RoutedBadge via={via} />
       </div>
-      {error && <ErrorBox msg={error} />}
+      {(keyMessage || error) && <ErrorBox msg={keyMessage || error} />}
       {images.length > 0 && (
         <div className="grid grid-cols-2 gap-3">
           {images.map((src, i) => (
@@ -126,7 +125,7 @@ export function ImageGenPanel() {
 const TTS_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
 
 export function TtsPanel() {
-  const key = usePlaygroundApiKey()
+  const { apiKey: key, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
   const [text, setText] = useState('')
   const [voice, setVoice] = useState('alloy')
   const [loading, setLoading] = useState(false)
@@ -135,6 +134,7 @@ export function TtsPanel() {
   const [via, setVia] = useState<string>()
 
   async function run() {
+    if (!isReady || !key) { setError(keyMessage ?? API_KEY_MISSING_MESSAGE); return }
     if (!text.trim() || loading) return
     setLoading(true); setError(''); setAudioUrl(undefined); setVia(undefined)
     try {
@@ -142,11 +142,9 @@ export function TtsPanel() {
         method: 'POST', headers: authHeaders(key),
         body: JSON.stringify({ input: text.trim(), voice }),
       })
+      assertApiSession(res)
       setVia(res.headers.get('X-Routed-Via') ?? undefined)
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        setError(data.error?.message ?? `HTTP ${res.status}`); return
-      }
+      if (!res.ok) await readApiJson(res)
       const blob = await res.blob()
       setAudioUrl(URL.createObjectURL(blob))
     } catch (e: any) { setError(e.message) }
@@ -174,12 +172,12 @@ export function TtsPanel() {
         </select>
       </div>
       <div className="flex items-center gap-3">
-        <Button onClick={run} disabled={loading || !text.trim()} size="sm">
+        <Button onClick={run} disabled={!isReady || loading || !text.trim()} size="sm">
           {loading ? 'Synthesising…' : 'Synthesise'}
         </Button>
         <RoutedBadge via={via} />
       </div>
-      {error && <ErrorBox msg={error} />}
+      {(keyMessage || error) && <ErrorBox msg={keyMessage || error} />}
       {audioUrl && <audio controls src={audioUrl} className="w-full" />}
     </PanelShell>
   )
@@ -189,7 +187,7 @@ export function TtsPanel() {
 // Speech-to-text — POST /v1/audio/transcriptions (JSON, data-url audio)
 // ──────────────────────────────────────────────────────────────────────
 export function SttPanel() {
-  const key = usePlaygroundApiKey()
+  const { apiKey: key, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
   const [fileName, setFileName] = useState('')
   const [dataUrl, setDataUrl] = useState<string>()
   const [loading, setLoading] = useState(false)
@@ -206,6 +204,7 @@ export function SttPanel() {
   }
 
   async function run() {
+    if (!isReady || !key) { setError(keyMessage ?? API_KEY_MISSING_MESSAGE); return }
     if (!dataUrl || loading) return
     setLoading(true); setError(''); setText(undefined); setVia(undefined)
     try {
@@ -214,8 +213,7 @@ export function SttPanel() {
         body: JSON.stringify({ audio: dataUrl }),
       })
       setVia(res.headers.get('X-Routed-Via') ?? undefined)
-      const data = await res.json()
-      if (!res.ok) { setError(data.error?.message ?? `HTTP ${res.status}`); return }
+      const data = await readApiJson<any>(res)
       setText(data.text ?? JSON.stringify(data))
     } catch (e: any) { setError(e.message) }
     finally { setLoading(false) }
@@ -232,12 +230,12 @@ export function SttPanel() {
         {fileName && <p className="text-[11px] text-muted-foreground">{fileName}</p>}
       </div>
       <div className="flex items-center gap-3">
-        <Button onClick={run} disabled={loading || !dataUrl} size="sm">
+        <Button onClick={run} disabled={!isReady || loading || !dataUrl} size="sm">
           {loading ? 'Transcribing…' : 'Transcribe'}
         </Button>
         <RoutedBadge via={via} />
       </div>
-      {error && <ErrorBox msg={error} />}
+      {(keyMessage || error) && <ErrorBox msg={keyMessage || error} />}
       {text != null && (
         <div className="rounded-md border bg-muted/50 px-3 py-2 text-sm whitespace-pre-wrap">{text}</div>
       )}
@@ -249,13 +247,14 @@ export function SttPanel() {
 // Embeddings — POST /v1/embeddings
 // ──────────────────────────────────────────────────────────────────────
 export function EmbeddingPanel() {
-  const key = usePlaygroundApiKey()
+  const { apiKey: key, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<{ dims: number; preview: number[]; model: string } | null>(null)
 
   async function run() {
+    if (!isReady || !key) { setError(keyMessage ?? API_KEY_MISSING_MESSAGE); return }
     if (!input.trim() || loading) return
     setLoading(true); setError(''); setResult(null)
     try {
@@ -263,8 +262,7 @@ export function EmbeddingPanel() {
         method: 'POST', headers: authHeaders(key),
         body: JSON.stringify({ input: input.trim() }),
       })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error?.message ?? `HTTP ${res.status}`); return }
+      const data = await readApiJson<any>(res)
       const vec: number[] = data.data?.[0]?.embedding ?? []
       if (vec.length === 0) { setError('No embedding returned'); return }
       setResult({ dims: vec.length, preview: vec.slice(0, 8), model: data.model ?? '?' })
@@ -283,10 +281,10 @@ export function EmbeddingPanel() {
           className="w-full resize-y rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50"
         />
       </div>
-      <Button onClick={run} disabled={loading || !input.trim()} size="sm">
+      <Button onClick={run} disabled={!isReady || loading || !input.trim()} size="sm">
         {loading ? 'Embedding…' : 'Embed'}
       </Button>
-      {error && <ErrorBox msg={error} />}
+      {(keyMessage || error) && <ErrorBox msg={keyMessage || error} />}
       {result && (
         <div className="rounded-md border bg-muted/50 px-3 py-2 space-y-1">
           <div className="flex gap-4 text-xs">
@@ -306,7 +304,7 @@ export function EmbeddingPanel() {
 // Rerank — POST /v1/rerank
 // ──────────────────────────────────────────────────────────────────────
 export function RerankPanel() {
-  const key = usePlaygroundApiKey()
+  const { apiKey: key, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
   const [query, setQuery] = useState('')
   const [docs, setDocs] = useState('')
   const [loading, setLoading] = useState(false)
@@ -314,6 +312,7 @@ export function RerankPanel() {
   const [results, setResults] = useState<{ doc: string; score: number }[] | null>(null)
 
   async function run() {
+    if (!isReady || !key) { setError(keyMessage ?? API_KEY_MISSING_MESSAGE); return }
     const documents = docs.split('\n').map(d => d.trim()).filter(Boolean)
     if (!query.trim() || documents.length === 0 || loading) return
     setLoading(true); setError(''); setResults(null)
@@ -322,8 +321,7 @@ export function RerankPanel() {
         method: 'POST', headers: authHeaders(key),
         body: JSON.stringify({ query: query.trim(), documents }),
       })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error?.message ?? `HTTP ${res.status}`); return }
+      const data = await readApiJson<any>(res)
       const ranked = (data.results ?? [])
         .map((r: any) => ({ doc: documents[r.index] ?? `#${r.index}`, score: r.relevance_score ?? 0 }))
       if (ranked.length === 0) { setError('No results returned'); return }
@@ -351,10 +349,10 @@ export function RerankPanel() {
           className="w-full resize-y rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50"
         />
       </div>
-      <Button onClick={run} disabled={loading || !query.trim() || !docs.trim()} size="sm">
+      <Button onClick={run} disabled={!isReady || loading || !query.trim() || !docs.trim()} size="sm">
         {loading ? 'Reranking…' : 'Rerank'}
       </Button>
-      {error && <ErrorBox msg={error} />}
+      {(keyMessage || error) && <ErrorBox msg={keyMessage || error} />}
       {results && (
         <div className="space-y-1.5">
           {results.map((r, i) => (

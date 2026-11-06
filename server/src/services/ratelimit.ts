@@ -145,19 +145,33 @@ export function recordTokens(
 
 export type CooldownReason = 'rate_limit_minute' | 'rate_limit_day' | 'rate_limit_unknown' | 'invalid_key' | 'model_gone';
 
+function isExplicitInvalidKey(message: string): boolean {
+  return /invalid[_ -]?api[_ -]?key|api[_ -]?key[_ -]?(?:is[_ -]?)?not[_ -]?valid|api_key_invalid|incorrect api key|\b(?:api[_ -]?key|(?:access|api|auth|bearer)[ _-]token)\b[^\n]{0,30}(?:revoked|invalid|expired)/i.test(message);
+}
+
+/** Scope is independent of duration. A daily MODEL quota is not a dead key.
+ * Bare 403 can mean this model requires a subscription, not revoked auth. */
+export function isKeyWideError(message: string): boolean {
+  const m = (message ?? '').toLowerCase();
+  if (isExplicitInvalidKey(m) || /\b401\b|unauthorized/.test(m)) return true;
+  if (/\b402\b|insufficient balance|out of credits|credits exhausted|余额不足|无可用资源包/.test(m)) return true;
+  // Require explicit account-wide quota language, not just the word account
+  // or project (many Google quotas are per-model AND per-project).
+  return /account[ -](?:wide|level)[^\n]{0,60}(?:quota|limit)[^\n]{0,30}(?:exceeded|exhausted|reached)/.test(m)
+    || /(?:quota|limit)[^\n]{0,30}(?:exceeded|exhausted|reached)[^\n]{0,40}account[ -](?:wide|level)/.test(m);
+}
+
 /**
  * Classify a provider error message to pick the right cooldown.
  *
- * Heuristic — providers don't have a unified vocabulary. We look for explicit
- * daily-quota words first (Google's `free_tier_requests` quota → "Quota
- * exceeded for ... per day"; Mistral's "tokens per day"; OpenRouter's "rate
- * limit ... per day"). Then short minute-burst markers. Else unknown.
+ * Explicit minute markers precede generic quota vocabulary. Generic exhausted
+ * quota retains the existing daily duration, but does NOT imply key-wide scope.
  */
 export function classifyError(message: string): CooldownReason {
   const m = (message ?? '').toLowerCase();
   // True auth failures (wrong/revoked key) — short 1h cooldown gives an
   // operator time to notice and rotate; retrying just spams the log.
-  if (m.includes('401') || m.includes('403') || m.includes('unauthorized') || m.includes('forbidden') || m.includes('invalid api key')) {
+  if (isExplicitInvalidKey(m) || m.includes('401') || m.includes('403') || m.includes('unauthorized') || m.includes('forbidden')) {
     return 'invalid_key';
   }
   // Dead route — the model id no longer resolves to any serving endpoint.
@@ -173,6 +187,11 @@ export function classifyError(message: string): CooldownReason {
       || ((m.includes('404') || m.includes('not found')) && !m.includes('per day') && !m.includes('per minute'))) {
     return 'model_gone';
   }
+  // Google uses both RESOURCE_EXHAUSTED / quota exceeded and an explicit
+  // per-minute metric. The metric wins over those generic day-bucket words.
+  if (/per[ _-]minute|\brpm\b|\btpm\b|requestsperminute|tokensperminute/.test(m)) {
+    return 'rate_limit_minute';
+  }
   // Day-bucket exhaustion — billing/wallet drained, daily quota hit, free
   // tier monthly cap, account-level credit gone. Retrying inside the day
   // cannot succeed; cool down until UTC midnight (or 24h, whichever is sooner).
@@ -181,7 +200,7 @@ export function classifyError(message: string): CooldownReason {
       || m.includes('per day') || m.includes('per-day') || m.includes('daily') || m.includes('per_day')
       || m.includes('rpd') || m.includes('tpd') || m.includes('free_tier_requests')
       || m.includes('quota exceeded') || m.includes('exceeded your current quota')
-      || m.includes('resource_exhausted') || m.includes('account')
+      || m.includes('resource_exhausted')
       // Zhipu returns balance/quota exhaustion in Chinese: "余额不足或无可用资源包"
       // (insufficient balance / no resource pack available). lowercase() does
       // not affect CJK, so match the raw substrings here.
@@ -269,7 +288,8 @@ export function setCooldown(
  *
  * Use when the upstream signal is account-level rather than model-level:
  *   - invalid_key       (revoked / wrong key)
- *   - rate_limit_day    (insufficient balance, account quota exhausted)
+ *   - confirmed account balance/quota exhaustion, NOT every rate_limit_day
+ * Callers should use isKeyWideError to distinguish scope from duration.
  *
  * Calling setCooldown(p, modelId, k, reason) instead would only block the
  * one model_id on that key — the next model_id in the cascade would hit

@@ -1,17 +1,21 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import type { ChatMessage } from '@myllm/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, classifyError } from '../services/ratelimit.js';
+import { routeRequest, recordSuccess, type RouteResult } from '../services/router.js';
+import { recordRequest, recordTokens, setCooldown, classifyError, isClientFault } from '../services/ratelimit.js';
 import { getDb } from '../db/index.js';
 import { authenticateClient, resolveEndUserId } from '../lib/clientAuth.js';
 import { checkEndUserLimit } from '../lib/endUserLimits.js';
+import { redactSecrets } from '../lib/redact.js';
 import {
   chatCompletionSchema,
   isRetryableError,
-  isModelLevelFailure,
+  applyChatFailure,
+  chatReasoningPolicy,
+  MAX_CHAT_ATTEMPTS,
   isBadRequestError,
   normalizeMessages,
+  estimateMessageTokens,
   resolvePreferredModel,
   resolveAlias,
   setStickyModel,
@@ -47,13 +51,6 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
     })),
   });
 });
-
-// Streaming cascade ceiling. 20 was too high — under a burst that cools the
-// top of the fallback chain, every retry tacks another TTFB window onto the
-// total wait. 8 (≈ 8 * 45s worst case = 6 min) is already past any reasonable
-// interactive budget; if the first 8 healthy keys can't serve the request,
-// the next ones won't either and 429 is a faster signal to the caller.
-const MAX_RETRIES = 8;
 
 // Streaming time-to-first-byte budget. fetchWithTimeout only bounds the
 // header phase for streams (the timer is cleared once headers arrive, so the
@@ -153,10 +150,7 @@ async function handleStreamingCompletion(
   const { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, response_format } = data;
   const messages: ChatMessage[] = normalizeMessages(data.messages);
 
-  const estimatedInputTokens = messages.reduce((sum, m) => {
-    if (typeof m.content !== 'string') return sum;
-    return sum + Math.ceil(m.content.length / 4);
-  }, 0);
+  const estimatedInputTokens = estimateMessageTokens(messages);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
   const requireVision = messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'));
@@ -182,8 +176,17 @@ async function handleStreamingCompletion(
     throw err;
   }
 
+  const { excludeReasoning, allowReasoningFallback } = chatReasoningPolicy(
+    data, !!data.model && !alias && preferredModel !== undefined, requireJsonMode,
+  );
+  if (data.no_cascade && data.model && !alias && preferredModel === undefined) {
+    res.status(400).json({ error: { message: 'Pinned model does not support the requested features.', type: 'routing_error' } });
+    return;
+  }
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
+  const platformAttempts = new Map<string, number>();
+  const maxRetries = data.no_cascade ? 1 : MAX_CHAT_ATTEMPTS;
   let lastError: any = null;
   // Headers are committed once the first real chunk OR a keepalive heartbeat
   // is written. Tracked across attempts: a cascade can switch models after
@@ -202,10 +205,14 @@ async function handleStreamingCompletion(
     }
   };
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requireVision, requireJsonMode, false, 'text', undefined, aliasChain, aliasPlatforms, skipModels.size > 0 ? skipModels : undefined);
+      route = routeRequest(estimatedTotal, skipKeys, preferredModel, requireVision, requireJsonMode, excludeReasoning, 'text', undefined, aliasChain, aliasPlatforms, skipModels, {
+        platformAttempts, allowReasoningFallback,
+        preferReasoningFallback: allowReasoningFallback && attempt === maxRetries - 1,
+        strictModelDbId: data.no_cascade && data.model && !alias ? preferredModel : undefined,
+      });
     } catch (err: any) {
       if (lastError) {
         endWithError(429, `All models rate-limited. Last error: ${lastError.message}`, 'rate_limit_error');
@@ -216,6 +223,7 @@ async function handleStreamingCompletion(
     }
 
     recordRequest(route.platform, route.modelId, route.keyId);
+    platformAttempts.set(route.platform, (platformAttempts.get(route.platform) ?? 0) + 1);
 
     let totalOutputTokens = 0;
     let streamStarted = false;   // first REAL chunk delivered
@@ -299,7 +307,7 @@ async function handleStreamingCompletion(
       // A real chunk already went out — the partial response is committed, so
       // a model switch is impossible. Surface the break as an SSE error.
       if (streamStarted) {
-        console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, err.message);
+        console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, redactSecrets(err.message));
         const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
         try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
         try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
@@ -309,29 +317,23 @@ async function handleStreamingCompletion(
       // No real chunk yet (only keepalive comments may have gone out) — safe
       // to cascade to another model even if the heartbeat flushed headers.
       if (isRetryableError(err)) {
-        const reason = classifyError(err.message);
-        if (isModelLevelFailure(err) || reason === 'model_gone') {
-          // Endpoint hung/unreachable, or the model id no longer resolves
-          // (model_gone) — skip the WHOLE model for this request so the cascade
-          // does not burn another full timeout / re-404 on its other keys.
-          skipModels.add(route.modelDbId);
-        } else {
-          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        }
-        setCooldown(route.platform, route.modelId, route.keyId, reason);
-        recordRateLimitHit(route.modelDbId);
+        const reason = applyChatFailure(route, err, skipKeys, skipModels);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        if (data.no_cascade) {
+          endWithError(502, `Provider error (${route.displayName}): ${err.message}`, 'provider_error');
+          return;
+        }
+        console.log(`[Proxy] ${redactSecrets(err.message)?.slice(0, 60)} from ${route.displayName} (${reason}), falling back (attempt ${attempt + 1}/${maxRetries})`);
         continue;
       }
 
       // Provider-specific 400/422 before any chunk flushed — skip this model
       // and cascade rather than sinking the request on one quirky endpoint.
-      if (isBadRequestError(err) && !streamStarted) {
+      if (isBadRequestError(err) && !isClientFault(err.message) && !data.no_cascade) {
         skipModels.add(route.modelDbId);
         setCooldown(route.platform, route.modelId, route.keyId, 'rate_limit_unknown');
         lastError = err;
-        console.log(`[Proxy] 400/422 from ${route.displayName} (stream), skipping model (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] 400/422 from ${route.displayName} (stream), skipping model (attempt ${attempt + 1}/${maxRetries})`);
         continue;
       }
 
@@ -340,5 +342,5 @@ async function handleStreamingCompletion(
     }
   }
 
-  endWithError(429, `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`, 'rate_limit_error');
+  endWithError(429, `All models rate-limited after ${maxRetries} attempts. Last: ${lastError?.message}`, 'rate_limit_error');
 }

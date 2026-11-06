@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '@/lib/api'
-import { usePlaygroundApiKey } from './playground/usePlaygroundApiKey'
+import { apiFetch, readApiJson } from '@/lib/api'
+import { API_KEY_MISSING_MESSAGE, usePlaygroundApiKey } from './playground/usePlaygroundApiKey'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
@@ -62,7 +62,7 @@ export default function PlaygroundPage() {
   const [selectedModel, setSelectedModel] = useState<string>('auto')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const apiKey = usePlaygroundApiKey()
+  const { apiKey, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
 
   const { data: fallbackEntries = [] } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -78,10 +78,10 @@ export default function PlaygroundPage() {
   const handleSend = async () => {
     const text = input.trim()
     if (!text || loading) return
-    if (!apiKey) {
+    if (!isReady || !apiKey) {
       setMessages([...messages, {
         role: 'assistant',
-        content: 'Error: The API key is still loading. Wait a moment and try again.',
+        content: keyMessage ?? API_KEY_MISSING_MESSAGE,
       }])
       return
     }
@@ -116,16 +116,7 @@ export default function PlaygroundPage() {
       const routedVia = res.headers.get('X-Routed-Via')
       const fallbackAttempts = res.headers.get('X-Fallback-Attempts')
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
-        setMessages([...newMessages, {
-          role: 'assistant',
-          content: `Error: ${err.error?.message ?? 'Unknown error'}`,
-        }])
-        return
-      }
-
-      const data = await res.json()
+      const data = await readApiJson<any>(res)
       const content = data.choices?.[0]?.message?.content ?? JSON.stringify(data, null, 2)
       const via = data._routed_via ?? (routedVia ? {
         platform: routedVia.split('/')[0],
@@ -145,7 +136,7 @@ export default function PlaygroundPage() {
     } catch (err: any) {
       setMessages([...newMessages, {
         role: 'assistant',
-        content: `Error: ${err.message}`,
+        content: `خطأ: ${err.message}`,
       }])
     } finally {
       setLoading(false)
@@ -274,6 +265,9 @@ export default function PlaygroundPage() {
           </div>
 
           <div className="border-t bg-background/50 p-3">
+            {keyMessage && (
+              <p role="alert" className="mb-2 text-xs text-destructive">{keyMessage}</p>
+            )}
             <div className="flex gap-2 items-end">
               <textarea
                 ref={inputRef}
@@ -290,7 +284,7 @@ export default function PlaygroundPage() {
                   el.style.height = Math.min(el.scrollHeight, 160) + 'px'
                 }}
               />
-              <Button onClick={handleSend} disabled={loading || !input.trim()} size="default">
+              <Button onClick={handleSend} disabled={!isReady || loading || !input.trim()} size="default">
                 {loading ? 'Sending…' : 'Send'}
               </Button>
             </div>

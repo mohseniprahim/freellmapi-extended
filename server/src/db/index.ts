@@ -2488,7 +2488,6 @@ function ensureUnifiedKey(db: Database.Database) {
   if (!existing) {
     const key = `myllm-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
   }
 }
 
@@ -2505,7 +2504,12 @@ export function ensureUnifiedKeyClientKey(db: Database.Database = getDb()): void
 
   const hash = crypto.createHash('sha256').update(row.value).digest('hex');
   const existing = db.prepare('SELECT id FROM client_keys WHERE key_hash = ?').get(hash);
-  if (existing) return;
+  if (existing) {
+    // Matching disabled/deleted rows still own this key. Only restore missing
+    // reveal data; never change their identity, revocation state or history.
+    backfillUnifiedKeyCipher(db, row.value, hash);
+    return;
+  }
 
   let encrypted: string | null = null;
   let iv: string | null = null;
@@ -2521,6 +2525,22 @@ export function ensureUnifiedKeyClientKey(db: Database.Database = getDb()): void
     INSERT INTO client_keys (name, key_hash, key_prefix, enabled, encrypted_key, iv, auth_tag)
     VALUES ('Unified API key', ?, ?, 1, ?, ?, ?)
   `).run(hash, row.value.slice(0, 16), encrypted, iv, authTag);
+}
+
+function backfillUnifiedKeyCipher(db: Database.Database, key: string, hash: string): void {
+  const missingCipher = `key_hash = ? AND (
+    encrypted_key IS NULL OR encrypted_key = '' OR
+    iv IS NULL OR iv = '' OR auth_tag IS NULL OR auth_tag = ''
+  )`;
+  if (!db.prepare(`SELECT id FROM client_keys WHERE ${missingCipher}`).get(hash)) return;
+
+  try {
+    const enc = encrypt(key);
+    db.prepare(`
+      UPDATE client_keys SET encrypted_key = ?, iv = ?, auth_tag = ?
+      WHERE ${missingCipher}
+    `).run(enc.encrypted, enc.iv, enc.authTag, hash);
+  } catch { /* hash authentication remains available even without reveal data */ }
 }
 
 export function regenerateUnifiedKey(): string {
@@ -2856,10 +2876,11 @@ function migrateModelsV57BalancedRerank(db: Database.Database) {
  * every project that pinned it).
  *
  * Add the same AES-256-GCM ciphertext columns the upstream `api_keys` table
- * already uses. ENCRYPTION_KEY only lives in .env so the risk profile is the
- * same as the existing provider-key table. Existing rows have NULL cipher;
- * id=1 ("Default") is back-filled from settings.unified_api_key since that
- * value is already stored in plain there.
+ * already uses, with the same env/DB encryption-key initialization. Existing
+ * rows have NULL cipher; only the row whose hash matches the plaintext in
+ * settings.unified_api_key can be back-filled, regardless of its id or state.
+ * Complete ciphertext is left untouched, even if an earlier migration stored
+ * the wrong key: a hash cannot recover an independent key's original value.
  */
 function migrateClientKeysV49Reveal(db: Database.Database) {
   const cols = db.prepare("PRAGMA table_info(client_keys)").all() as Array<{ name: string }>;
@@ -2870,19 +2891,11 @@ function migrateClientKeysV49Reveal(db: Database.Database) {
       ALTER TABLE client_keys ADD COLUMN auth_tag TEXT;
     `);
   }
-  // Back-fill id=1 from settings.unified_api_key when we can (deferred import
-  // would be cleaner; inline require keeps the helper self-contained).
-  const row = db.prepare('SELECT id, encrypted_key FROM client_keys WHERE id = 1').get() as
-    { id: number; encrypted_key: string | null } | undefined;
-  if (row && !row.encrypted_key) {
-    const unified = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as
-      { value: string } | undefined;
-    if (unified?.value) {
-      const enc = encrypt(unified.value);
-      db.prepare(`
-        UPDATE client_keys SET encrypted_key = ?, iv = ?, auth_tag = ? WHERE id = 1
-      `).run(enc.encrypted, enc.iv, enc.authTag);
-    }
+  const unified = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as
+    { value: string } | undefined;
+  if (unified?.value) {
+    const hash = crypto.createHash('sha256').update(unified.value).digest('hex');
+    backfillUnifiedKeyCipher(db, unified.value, hash);
   }
 }
 
@@ -2966,17 +2979,21 @@ export function createClientKey(name: string): { row: ClientKeyRow; plainKey: st
 }
 
 /**
- * Decrypt and return the plain key value for a row. Returns null when the
- * row is missing OR when it was created before V49 (encrypted_key=NULL); in
- * that case the operator must regenerate the key.
+ * Return the decrypted key only when its SHA-256 matches this row's identity.
+ * Missing, incomplete, corrupt or mismatched ciphertext is unavailable; never
+ * reveal another client's key or automatically rotate the original key.
  */
 export function revealClientKey(id: number): string | null {
   const row = getDb().prepare(`
-    SELECT encrypted_key, iv, auth_tag FROM client_keys WHERE id = ?
-  `).get(id) as { encrypted_key: string | null; iv: string | null; auth_tag: string | null } | undefined;
+    SELECT key_hash, encrypted_key, iv, auth_tag FROM client_keys WHERE id = ?
+  `).get(id) as {
+    key_hash: string; encrypted_key: string | null; iv: string | null; auth_tag: string | null;
+  } | undefined;
   if (!row || !row.encrypted_key || !row.iv || !row.auth_tag) return null;
   try {
-    return decrypt(row.encrypted_key, row.iv, row.auth_tag);
+    const plain = decrypt(row.encrypted_key, row.iv, row.auth_tag);
+    const hash = crypto.createHash('sha256').update(plain).digest('hex');
+    return hash === row.key_hash ? plain : null;
   } catch {
     return null;
   }

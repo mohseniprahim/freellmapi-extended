@@ -62,6 +62,17 @@ export interface RouteResult {
   intelligenceRank: number;
 }
 
+export interface ChatCascadeOptions {
+  /** Request-local fairness: failed providers must not consume every retry. */
+  platformAttempts?: ReadonlyMap<string, number>;
+  /** Omitted reasoning policy may fall back, but explicit false may not. */
+  allowReasoningFallback?: boolean;
+  /** Reserve the final bounded retry for last-resort reasoning, if eligible. */
+  preferReasoningFallback?: boolean;
+  /** Diagnostic no_cascade pins must never silently select another model. */
+  strictModelDbId?: number;
+}
+
 // Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
 
@@ -183,6 +194,7 @@ export function routeRequest(
   // upstream endpoint is hung, so the cascade does not waste another full
   // timeout retrying its other keys against the same dead endpoint.
   skipModels?: Set<number>,
+  cascadeOptions?: ChatCascadeOptions,
 ): RouteResult {
   const db = getDb();
 
@@ -206,7 +218,12 @@ export function routeRequest(
   // request then continues down the full chain rather than failing.
   if (priorityPrefix && priorityPrefix.length > 0) {
     const prefixSet = new Set(priorityPrefix);
-    const prefix = priorityPrefix.map((id, i) => ({ model_db_id: id, priority: i + 1, enabled: 1 }));
+    // Reorder existing entries only; an alias is not permission to enable a
+    // disabled (or missing) fallback entry.
+    const prefix = priorityPrefix.flatMap(id => {
+      const entry = sortedChain.find(e => e.model_db_id === id);
+      return entry ? [entry] : [];
+    });
     const rest = sortedChain.filter(e => !prefixSet.has(e.model_db_id));
     sortedChain = [...prefix, ...rest];
   }
@@ -220,9 +237,31 @@ export function routeRequest(
     }
   }
 
+  const reasoningFallback = excludeReasoning && !requireJsonMode
+    && cascadeOptions?.allowReasoningFallback === true;
+  if (reasoningFallback || cascadeOptions?.platformAttempts?.size) {
+    const metadata = new Map((db.prepare('SELECT id, platform, is_reasoning FROM models').all() as
+      Array<{ id: number; platform: string; is_reasoning: number }>).map(m => [m.id, m]));
+    // Stable sort preserves catalog/alias/pin priority within each group.
+    // Normally ALL eligible non-reasoning models precede reasoning. Only the
+    // final retry may prioritize reasoning, after the regular retry budget.
+    sortedChain.sort((a, b) => {
+      const ma = metadata.get(a.model_db_id);
+      const mb = metadata.get(b.model_db_id);
+      if (reasoningFallback) {
+        const reasoningOrder = Number(ma?.is_reasoning === 1) - Number(mb?.is_reasoning === 1);
+        if (reasoningOrder) return cascadeOptions?.preferReasoningFallback ? -reasoningOrder : reasoningOrder;
+      }
+      return (cascadeOptions?.platformAttempts?.get(ma?.platform ?? '') ?? 0)
+        - (cascadeOptions?.platformAttempts?.get(mb?.platform ?? '') ?? 0);
+    });
+  }
+
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
     if (skipModels?.has(entry.model_db_id)) continue;
+    if (cascadeOptions?.strictModelDbId !== undefined
+        && entry.model_db_id !== cascadeOptions.strictModelDbId) continue;
 
     // Get model details. Flags layered: vision (image content present) and
     // json mode (structured-output request). Reasoning models are excluded
@@ -247,7 +286,7 @@ export function routeRequest(
     }
     if (requireVision)    whereParts.push('vision_capable = 1');
     if (requireJsonMode)  whereParts.push('supports_json_mode = 1', 'is_reasoning = 0');
-    if (excludeReasoning && !requireJsonMode) whereParts.push('is_reasoning = 0');
+    if (excludeReasoning && !requireJsonMode && !reasoningFallback) whereParts.push('is_reasoning = 0');
     const model = db.prepare(
       `SELECT * FROM models WHERE ${whereParts.join(' AND ')}`
     ).get(entry.model_db_id) as ModelRow | undefined;
@@ -301,7 +340,7 @@ export function routeRequest(
       idx++;
 
       const skipId = `${model.platform}:${model.model_id}:${key.id}`;
-      if (skipKeys?.has(skipId)) continue;
+      if (skipKeys?.has(skipId) || skipKeys?.has(`${model.platform}:*:${key.id}`)) continue;
 
       // Check cooldown (from previous 429s)
       if (isOnCooldown(model.platform, model.model_id, key.id)) continue;

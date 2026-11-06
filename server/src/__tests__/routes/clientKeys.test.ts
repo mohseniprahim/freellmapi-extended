@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
+import { encrypt } from '../../lib/crypto.js';
 import {
   initDb,
   getDb,
@@ -14,40 +15,61 @@ import {
 
 async function req(app: Express, method: string, path: string, body?: any) {
   const server = app.listen(0);
-  const addr = server.address() as any;
-  const url = `http://127.0.0.1:${addr.port}${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
-  server.close();
-  return { status: res.status, body: data };
+  try {
+    const addr = server.address() as any;
+    const url = `http://127.0.0.1:${addr.port}${path}`;
+    const res = await fetch(url, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null };
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+    });
+  }
+}
+
+function setIndependentDefault(key: string) {
+  const enc = encrypt(key);
+  getDb().prepare(`
+    UPDATE client_keys SET key_hash = ?, key_prefix = ?, encrypted_key = ?, iv = ?, auth_tag = ?
+    WHERE id = 1
+  `).run(createHash('sha256').update(key).digest('hex'), key.slice(0, 16), enc.encrypted, enc.iv, enc.authTag);
 }
 
 describe('Client Keys CRUD', () => {
   let app: Express;
 
-  beforeAll(() => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+  beforeEach(() => {
+    vi.stubEnv('ENCRYPTION_KEY', '0'.repeat(64));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
     initDb(':memory:');
     app = createApp();
   });
 
-  beforeEach(() => {
-    const db = getDb();
-    db.prepare('DELETE FROM client_keys WHERE id != 1').run();
+  afterEach(() => {
+    getDb().close();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
-  it('V46 seeds the unified key as id=1 "Genel"', async () => {
+  it('V46 seeds the unified key as id=1 "Default"', async () => {
     const r = await req(app, 'GET', '/api/client-keys');
     expect(r.status).toBe(200);
     const general = r.body.find((k: any) => k.id === 1);
     expect(general).toBeDefined();
     expect(general.name).toBe('Default');
     expect(general.enabled).toBe(1);
+  });
+
+  it('never logs the plaintext unified key on fresh startup', () => {
+    const unified = getUnifiedApiKey();
+    const loggedSecret = vi.mocked(console.log).mock.calls.some(args =>
+      args.some(value => String(value).includes(unified)));
+    expect(loggedSecret).toBe(false);
   });
 
   it('legacy unified key still authenticates', () => {
@@ -96,7 +118,7 @@ describe('Client Keys CRUD', () => {
     expect(authenticateApiKey(created.body.key)).toBeNull();
   });
 
-  it('DELETE id=1 ("Genel") is rejected', async () => {
+  it('DELETE id=1 ("Default") is rejected', async () => {
     const r = await req(app, 'DELETE', '/api/client-keys/1');
     expect(r.status).toBe(400);
     expect(getDb().prepare('SELECT id FROM client_keys WHERE id = 1').get()).toBeDefined();
@@ -111,14 +133,13 @@ describe('Client Keys CRUD', () => {
     const created = await req(app, 'POST', '/api/client-keys', { name: 'Revealable' });
     const reveal = await req(app, 'GET', `/api/client-keys/${created.body.id}/reveal`);
     expect(reveal.status).toBe(200);
-    expect(reveal.body.key).toBe(created.body.key);
+    expect(reveal.body.key === created.body.key).toBe(true);
   });
 
   it('GET /:id/reveal on the seeded Default key (V49 back-fill) works', async () => {
     const reveal = await req(app, 'GET', '/api/client-keys/1/reveal');
     expect(reveal.status).toBe(200);
     expect(reveal.body.key).toMatch(/^myllm-/);
-    // Sanity: revealed value authenticates as id=1.
     expect(authenticateApiKey(reveal.body.key)).toEqual({ id: 1, name: 'Default' });
   });
 
@@ -127,21 +148,48 @@ describe('Client Keys CRUD', () => {
     expect(reveal.status).toBe(404);
   });
 
+  it.each(['missing ciphertext', 'missing IV', 'missing tag', 'corrupt tag', 'wrong plaintext'])(
+    'GET /:id/reveal returns 410 without secrets for %s', async scenario => {
+      const created = await req(app, 'POST', '/api/client-keys', { name: 'Unavailable' });
+      const db = getDb();
+      const id = created.body.id;
+      const otherKey = 'synthetic-other-client-key';
+      if (scenario === 'wrong plaintext') {
+        const enc = encrypt(otherKey);
+        db.prepare('UPDATE client_keys SET encrypted_key = ?, iv = ?, auth_tag = ? WHERE id = ?')
+          .run(enc.encrypted, enc.iv, enc.authTag, id);
+      } else {
+        const column = scenario === 'missing ciphertext' ? 'encrypted_key'
+          : scenario === 'missing IV' ? 'iv' : 'auth_tag';
+        db.prepare(`UPDATE client_keys SET ${column} = ? WHERE id = ?`)
+          .run(scenario === 'corrupt tag' ? 'not-a-valid-tag' : null, id);
+      }
+      const before = db.prepare('SELECT * FROM client_keys WHERE id = ?').get(id);
+      expect(revealClientKey(id)).toBeNull();
+      const response = await req(app, 'GET', `/api/client-keys/${id}/reveal`);
+      expect(response.status).toBe(410);
+      expect(response.body.key).toBeUndefined();
+      const body = JSON.stringify(response.body);
+      expect(body.includes(created.body.key) || body.includes(otherKey)).toBe(false);
+      expect(db.prepare('SELECT * FROM client_keys WHERE id = ?').get(id)).toEqual(before);
+      expect(authenticateApiKey(created.body.key)).toEqual({ id, name: 'Unavailable' });
+    },
+  );
+
   it('regenerating the unified key keeps Default auth and reveal in sync', () => {
     const previous = getUnifiedApiKey();
     const regenerated = regenerateUnifiedKey();
 
-    expect(regenerated).not.toBe(previous);
+    expect(regenerated !== previous).toBe(true);
     expect(authenticateApiKey(previous)).toBeNull();
     expect(authenticateApiKey(regenerated)).toEqual({ id: 1, name: 'Default' });
-    expect(revealClientKey(1)).toBe(regenerated);
+    expect(revealClientKey(1) === regenerated).toBe(true);
   });
 
   it('registers a separate unified key without replacing a distinct Default client key', () => {
     const separateDefault = `myllm-${'a'.repeat(48)}`;
-    const separateHash = createHash('sha256').update(separateDefault).digest('hex');
-    getDb().prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
-      .run(separateHash, separateDefault.slice(0, 16));
+    setIndependentDefault(separateDefault);
+    const original = getDb().prepare('SELECT * FROM client_keys WHERE id = 1').get();
 
     const regenerated = regenerateUnifiedKey();
     const unifiedHash = createHash('sha256').update(regenerated).digest('hex');
@@ -152,41 +200,63 @@ describe('Client Keys CRUD', () => {
     expect(unifiedRow?.id).not.toBe(1);
     expect(unifiedRow?.name).toBe('Unified API key');
     expect(authenticateApiKey(regenerated)).toEqual({ id: unifiedRow!.id, name: 'Unified API key' });
+    expect(getDb().prepare('SELECT * FROM client_keys WHERE id = 1').get()).toEqual(original);
+    expect(revealClientKey(1) === separateDefault).toBe(true);
     expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
-    expect(revealClientKey(unifiedRow!.id)).toBe(regenerated);
+    expect(revealClientKey(unifiedRow!.id) === regenerated).toBe(true);
   });
 
   it('backfills the current unified key without rotating it or overwriting Default', () => {
     const db = getDb();
     const unified = getUnifiedApiKey();
     const unifiedHash = createHash('sha256').update(unified).digest('hex');
-    const defaultRow = db.prepare('SELECT key_hash, key_prefix FROM client_keys WHERE id = 1').get() as
-      { key_hash: string; key_prefix: string };
     const separateDefault = `myllm-${'b'.repeat(48)}`;
-    const separateHash = createHash('sha256').update(separateDefault).digest('hex');
+    setIndependentDefault(separateDefault);
+    const original = db.prepare('SELECT * FROM client_keys WHERE id = 1').get();
 
-    db.prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
-      .run(separateHash, separateDefault.slice(0, 16));
-    try {
-      ensureUnifiedKeyClientKey(db);
+    ensureUnifiedKeyClientKey(db);
+    const mapped = db.prepare('SELECT id, name FROM client_keys WHERE key_hash = ?').get(unifiedHash) as
+      { id: number; name: string } | undefined;
+    expect(mapped).toBeDefined();
+    expect(mapped?.id).not.toBe(1);
+    expect(mapped?.name).toBe('Unified API key');
+    expect(authenticateApiKey(unified)).toEqual({ id: mapped!.id, name: 'Unified API key' });
+    expect(getUnifiedApiKey() === unified).toBe(true);
+    expect(revealClientKey(mapped!.id) === unified).toBe(true);
 
-      const mapped = db.prepare('SELECT id, name FROM client_keys WHERE key_hash = ?').get(unifiedHash) as
-        { id: number; name: string } | undefined;
-      expect(mapped).toBeDefined();
-      expect(mapped?.id).not.toBe(1);
-      expect(mapped?.name).toBe('Unified API key');
-      expect(authenticateApiKey(unified)).toEqual({ id: mapped!.id, name: 'Unified API key' });
-
-      ensureUnifiedKeyClientKey(db);
-      expect(db.prepare('SELECT COUNT(*) AS count FROM client_keys WHERE key_hash = ?').get(unifiedHash))
-        .toEqual({ count: 1 });
-      expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
-    } finally {
-      db.prepare('DELETE FROM client_keys WHERE key_hash = ?').run(unifiedHash);
-      db.prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
-        .run(defaultRow.key_hash, defaultRow.key_prefix);
-    }
+    ensureUnifiedKeyClientKey(db);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM client_keys WHERE key_hash = ?').get(unifiedHash))
+      .toEqual({ count: 1 });
+    expect(db.prepare('SELECT * FROM client_keys WHERE id = 1').get()).toEqual(original);
+    expect(revealClientKey(1) === separateDefault).toBe(true);
+    expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
   });
+
+  it.each(['active', 'disabled', 'deleted'])(
+    'backfills missing cipher for a matching %s nondefault row without changing its state', state => {
+      const db = getDb();
+      const unified = getUnifiedApiKey();
+      setIndependentDefault('synthetic-independent-default');
+      db.prepare(`
+        INSERT INTO client_keys (id, name, key_hash, key_prefix, enabled, deleted_at, created_at, last_used_at)
+        VALUES (5, 'Legacy unified', ?, ?, ?, ?, '2020-01-01 00:00:00', '2020-01-02 00:00:00')
+      `).run(createHash('sha256').update(unified).digest('hex'), unified.slice(0, 16),
+        state === 'active' ? 1 : 0, state === 'deleted' ? '2020-01-03 00:00:00' : null);
+      const metadata = () => db.prepare(`
+        SELECT id, name, key_hash, key_prefix, enabled, deleted_at, created_at, last_used_at
+        FROM client_keys ORDER BY id
+      `).all();
+      const before = metadata();
+      ensureUnifiedKeyClientKey(db);
+      expect(metadata()).toEqual(before);
+      expect(revealClientKey(5) === unified).toBe(true);
+      const complete = db.prepare('SELECT * FROM client_keys ORDER BY id').all();
+      ensureUnifiedKeyClientKey(db);
+      expect(db.prepare('SELECT * FROM client_keys ORDER BY id').all()).toEqual(complete);
+      expect(getUnifiedApiKey() === unified).toBe(true);
+      expect(authenticateApiKey(unified)).toEqual(state === 'active' ? { id: 5, name: 'Legacy unified' } : null);
+    },
+  );
 
   it('POST regenerate endpoint persists a /v1-authenticating key', async () => {
     const response = await req(app, 'POST', '/api/settings/api-key/regenerate');

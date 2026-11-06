@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Label } from '@/components/ui/label'
-import { usePlaygroundApiKey } from './usePlaygroundApiKey'
+import { readApiJson } from '@/lib/api'
+import { API_KEY_MISSING_MESSAGE, usePlaygroundApiKey } from './usePlaygroundApiKey'
 
 type Mode = 'inpaint' | 'outpaint'
 type OutDir = 'left' | 'right' | 'top' | 'bottom' | 'all'
@@ -49,7 +50,7 @@ export default function ImageEditPanel() {
   const [result, setResult] = useState<ResultBlock | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  const apiKey = usePlaygroundApiKey()
+  const { apiKey, isReady, message: keyMessage } = usePlaygroundApiKey({ withState: true })
 
   // Reset mask when source or mode changes
   useEffect(() => {
@@ -191,6 +192,11 @@ export default function ImageEditPanel() {
   }
 
   async function handleSubmit() {
+    if (!isReady || !apiKey) {
+      setError(keyMessage ?? API_KEY_MISSING_MESSAGE)
+      return
+    }
+    if (loading) return
     if (!imageDataUrl) {
       setError('Upload an image first.')
       return
@@ -203,8 +209,7 @@ export default function ImageEditPanel() {
     setResult(null)
     setLoading(true)
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }
       const base = import.meta.env.BASE_URL.replace(/\/$/, '')
       const img = getImageDataUrl()!
       const start = Date.now()
@@ -236,12 +241,7 @@ export default function ImageEditPanel() {
         body: JSON.stringify(body),
       })
       const latency = Date.now() - start
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
-        setError(err.error?.message ?? `HTTP ${res.status}`)
-        return
-      }
-      const data = await res.json()
+      const data = await readApiJson<any>(res)
       const b64 = data.data?.[0]?.b64_json
       if (!b64) {
         setError('No image returned.')
@@ -437,16 +437,16 @@ export default function ImageEditPanel() {
               </>
             )}
 
-            {error && (
-              <div className="rounded-md border border-red-300/60 bg-red-50/60 px-3 py-2 text-xs text-red-700">
-                {error}
+            {(keyMessage || error) && (
+              <div role="alert" className="rounded-md border border-red-300/60 bg-red-50/60 px-3 py-2 text-xs text-red-700">
+                {keyMessage || error}
               </div>
             )}
 
             <div className="mt-auto pt-2 space-y-2">
               <Button
                 onClick={handleSubmit}
-                disabled={loading || !imageDataUrl || !prompt.trim()}
+                disabled={!isReady || loading || !imageDataUrl || !prompt.trim()}
                 className="w-full bg-teal-700 hover:bg-teal-800 text-white"
               >
                 {loading ? 'Generating…' : mode === 'inpaint' ? 'Run inpaint' : 'Run outpaint'}

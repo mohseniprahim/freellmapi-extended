@@ -1,77 +1,89 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import Database from 'better-sqlite3';
-import { initDb } from '../../db/index.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type Database from 'better-sqlite3';
+import { initDb, getUnifiedApiKey, authenticateApiKey, revealClientKey } from '../../db/index.js';
 
 /**
- * Migrations V1–V9 must be idempotent: running initDb twice on the same
- * physical database file should produce identical state. New migrations
- * (V10+) should be added to this test as they ship.
+ * Running initDb twice on the same physical database should preserve catalog
+ * counts and client-key identity. Every test starts with its own memory DB;
+ * reopen tests persist that fixture to a private, cleaned-up temporary file.
  */
 describe('Migration idempotency', () => {
-  it('backfills a rotated unified key without colliding with existing id=1', () => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    const tmpPath = `/tmp/freeapi-v46-id1-${Date.now()}.db`;
-    const db1 = initDb(tmpPath);
-    const original = db1.prepare('SELECT key_hash FROM client_keys WHERE id = 1').get() as
-      { key_hash: string };
-    const rotated = `rotated-unified-key-${Date.now()}`;
-    db1.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(rotated);
-    db1.close();
+  let db: Database.Database;
+  let directory: string;
+  let dbPath: string;
 
-    const db2 = initDb(tmpPath);
-    const rows = db2.prepare('SELECT id, key_hash FROM client_keys ORDER BY id').all() as
-      Array<{ id: number; key_hash: string }>;
-    const rotatedHash = createHash('sha256').update(rotated).digest('hex');
-    expect(rows).toEqual([
-      { id: 1, key_hash: original.key_hash },
-      { id: 2, key_hash: rotatedHash },
-    ]);
-    db2.close();
+  beforeEach(() => {
+    vi.stubEnv('ENCRYPTION_KEY', '0'.repeat(64));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    directory = mkdtempSync(join(tmpdir(), 'freeapi-idempotency-'));
+    dbPath = join(directory, 'fixture.db');
+    db = initDb(':memory:');
   });
 
-  it('initDb on a fresh in-memory DB then re-run produces identical row counts', () => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    // Use a single shared file so both inits hit the same DB.
-    const tmpPath = `/tmp/freeapi-idempotency-${Date.now()}.db`;
+  afterEach(() => {
+    try {
+      if (db?.open) db.close();
+      rmSync(directory, { recursive: true, force: true });
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+    }
+  });
 
-    const db1 = initDb(tmpPath);
-    const before = {
-      models: (db1.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
-      fallback: (db1.prepare('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
-      enabledModels: (db1.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
-      disabledModels: (db1.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
-      orphanFallbacks: (db1.prepare(`
+  async function reopen() {
+    if (db.name === ':memory:') await db.backup(dbPath);
+    db.close();
+    db = initDb(dbPath);
+  }
+
+  it('backfills a formerly rotated unified setting without colliding with existing id=1', async () => {
+    const originalKey = getUnifiedApiKey();
+    const original = db.prepare('SELECT * FROM client_keys WHERE id = 1').get();
+    const legacyUnified = 'synthetic-legacy-unified-setting';
+    const legacyHash = createHash('sha256').update(legacyUnified).digest('hex');
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(legacyUnified);
+
+    await reopen();
+    expect(db.prepare('SELECT id, key_hash FROM client_keys ORDER BY id').all()).toEqual([
+      { id: 1, key_hash: createHash('sha256').update(originalKey).digest('hex') },
+      { id: 2, key_hash: legacyHash },
+    ]);
+    expect(db.prepare('SELECT * FROM client_keys WHERE id = 1').get()).toEqual(original);
+    expect(revealClientKey(1) === originalKey).toBe(true);
+    expect(revealClientKey(2) === legacyUnified).toBe(true);
+    const afterFirst = db.prepare('SELECT * FROM client_keys ORDER BY id').all();
+    await reopen();
+    expect(db.prepare('SELECT * FROM client_keys ORDER BY id').all()).toEqual(afterFirst);
+    expect(getUnifiedApiKey() === legacyUnified).toBe(true);
+    expect(authenticateApiKey(originalKey)).toEqual({ id: 1, name: 'Default' });
+    expect(authenticateApiKey(legacyUnified)).toEqual({ id: 2, name: 'Unified API key' });
+  });
+
+  it('re-running initDb on the same database produces identical catalog row counts', async () => {
+    const counts = () => ({
+      models: (db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
+      fallback: (db.prepare('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
+      enabledModels: (db.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
+      disabledModels: (db.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
+      orphanFallbacks: (db.prepare(`
         SELECT COUNT(*) AS c FROM fallback_config f
         LEFT JOIN models m ON f.model_db_id = m.id
         WHERE m.id IS NULL
       `).get() as { c: number }).c,
-    };
-    db1.close();
-
-    // Re-init the same DB file — V1..V9 should all no-op idempotently.
-    const db2 = initDb(tmpPath);
-    const after = {
-      models: (db2.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c,
-      fallback: (db2.prepare('SELECT COUNT(*) AS c FROM fallback_config').get() as { c: number }).c,
-      enabledModels: (db2.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 1').get() as { c: number }).c,
-      disabledModels: (db2.prepare('SELECT COUNT(*) AS c FROM models WHERE enabled = 0').get() as { c: number }).c,
-      orphanFallbacks: (db2.prepare(`
-        SELECT COUNT(*) AS c FROM fallback_config f
-        LEFT JOIN models m ON f.model_db_id = m.id
-        WHERE m.id IS NULL
-      `).get() as { c: number }).c,
-    };
-    db2.close();
-
-    expect(after).toEqual(before);
-    expect(after.orphanFallbacks).toBe(0);
+    });
+    const before = counts();
+    await reopen();
+    expect(counts()).toEqual(before);
+    await reopen();
+    expect(counts()).toEqual(before);
+    expect(counts().orphanFallbacks).toBe(0);
   });
 
   it('every catalog row has exactly one fallback_config entry', () => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    const db = initDb(':memory:');
-
     const rows = db.prepare(`
       SELECT m.id, COUNT(f.id) AS fb_count
         FROM models m
@@ -84,9 +96,6 @@ describe('Migration idempotency', () => {
   });
 
   it('UNIQUE(platform, model_id) constraint holds — no duplicate catalog rows', () => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    const db = initDb(':memory:');
-
     const dups = db.prepare(`
       SELECT platform, model_id, COUNT(*) AS c FROM models
        GROUP BY platform, model_id
@@ -97,10 +106,7 @@ describe('Migration idempotency', () => {
   });
 
   it('all enabled catalog platforms have a registered provider', async () => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    const db = initDb(':memory:');
     const { hasProvider } = await import('../../providers/index.js');
-
     const platforms = (db.prepare(
       `SELECT DISTINCT platform FROM models WHERE enabled = 1`
     ).all() as { platform: any }[]).map(r => r.platform);
