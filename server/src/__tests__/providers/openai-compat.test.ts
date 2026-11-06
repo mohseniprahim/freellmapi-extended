@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 
 describe('OpenAICompatProvider', () => {
@@ -12,6 +12,8 @@ describe('OpenAICompatProvider', () => {
       extraHeaders: { 'X-Custom': 'test' },
     });
   });
+
+  afterEach(() => vi.restoreAllMocks());
 
   it('should set platform and name from config', () => {
     expect(provider.platform).toBe('groq');
@@ -120,119 +122,188 @@ describe('OpenAICompatProvider', () => {
     await expect(provider.validateKey('any')).rejects.toThrow(/ECONNREFUSED/);
   });
 
-  it('folds reasoning_content into content when content is empty (Z.ai glm-4.5-flash style)', async () => {
+  async function completeMessage(message: Record<string, unknown>, finishReason = 'stop') {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({
         id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: '', reasoning_content: 'the actual answer' },
-          finish_reason: 'stop',
-        }],
+        choices: [{ index: 0, message: { role: 'assistant', ...message }, finish_reason: finishReason }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       }),
     } as any);
 
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
-    expect(result.choices[0].message.content).toBe('the actual answer');
+    return provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+  }
+
+  async function streamDeltas(deltas: Record<string, unknown>[], finishReason = 'stop') {
+    const events = deltas.map((delta, index) => `data: ${JSON.stringify({
+      id: 'id', object: 'chat.completion.chunk', created: 1, model: 'm',
+      choices: [{ index: 0, delta, finish_reason: index === deltas.length - 1 ? finishReason : null }],
+    })}\n\n`).join('') + 'data: [DONE]\n\n';
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(events, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    }));
+
+    const chunks = [];
+    for await (const chunk of provider.streamChatCompletion('k', [{ role: 'user', content: 'hi' }], 'm')) {
+      chunks.push(chunk);
+    }
+    return chunks;
+  }
+
+  it.each(['reasoning_content', 'reasoning', 'reasoning_details', 'thinking',
+    'thinking_content', 'thinking_blocks', 'analysis', 'analysis_content'])(
+    'strips %s without promoting it into empty final content', async (field) => {
+      const result = await completeMessage({ content: '', [field]: 'synthetic private block' });
+      expect(result.choices[0].message.content).toBe('');
+      expect(result.choices[0].message).not.toHaveProperty(field);
+    },
+  );
+
+  it('preserves null final content when reasoning exhausts the response budget', async () => {
+    const result = await completeMessage({
+      content: null,
+      reasoning_content: 'We need to follow internal policies...',
+    }, 'length');
+    expect(result.choices[0].message.content).toBeNull();
+    expect(result.choices[0].message).not.toHaveProperty('reasoning_content');
+    expect(result.choices[0].finish_reason).toBe('length');
+    expect(result.usage).toEqual({ prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+    expect(result._routed_via).toEqual({ platform: 'groq', model: 'm' });
   });
 
   it('flattens array content into a string (Mistral magistral style)', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: [{ type: 'text', text: 'part one ' }, { type: 'text', text: 'part two' }] },
-          finish_reason: 'stop',
-        }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
-
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    const result = await completeMessage({
+      content: [{ type: 'text', text: 'part one ' }, { type: 'text', text: 'part two' }],
+    });
     expect(result.choices[0].message.content).toBe('part one part two');
   });
 
-  it('folds reasoning into content when content is empty (Ollama style — bare `reasoning` field)', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: '', reasoning: 'ollama answer' },
-          finish_reason: 'stop',
-        }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
-
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
-    expect(result.choices[0].message.content).toBe('ollama answer');
+  it('flattens only strings and explicitly typed text blocks from mixed content', async () => {
+    const result = await completeMessage({
+      content: [
+        { type: 'thinking', text: 'synthetic private block' },
+        { type: 'reasoning', text: 'synthetic private block' },
+        { type: 'analysis', text: 'synthetic private block' },
+        { type: 'text', text: 'مرحبا ' },
+        'بك',
+        { text: 'untyped block' },
+        { type: 'image_url', text: 'not final text' },
+        { type: 'text', text: 123 },
+        null,
+        123,
+      ],
+    });
+    expect(result.choices[0].message.content).toBe('مرحبا بك');
   });
 
-  it('prefers reasoning_content over reasoning when both are present', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: '', reasoning_content: 'preferred', reasoning: 'fallback' },
-          finish_reason: 'stop',
-        }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
-
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
-    expect(result.choices[0].message.content).toBe('preferred');
+  it('does not substitute any side channel when all content blocks are private', async () => {
+    const result = await completeMessage({
+      content: [{ type: 'thinking', text: 'synthetic private block' }],
+      reasoning_content: 'synthetic private block',
+      reasoning: 'synthetic private block',
+    });
+    expect(result.choices[0].message.content).toBe('');
+    expect(result.choices[0].message).not.toHaveProperty('reasoning_content');
+    expect(result.choices[0].message).not.toHaveProperty('reasoning');
   });
 
-  it('does NOT fold reasoning_content when tool_calls are present', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: null,
-            reasoning_content: 'I am thinking about the tool',
-            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }],
-          },
-          finish_reason: 'tool_calls',
-        }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
-
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+  it('preserves null content and tool calls while stripping reasoning', async () => {
+    const toolCalls = [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }];
+    const result = await completeMessage({
+      content: null,
+      reasoning_content: 'synthetic private block',
+      tool_calls: toolCalls,
+    }, 'tool_calls');
     expect(result.choices[0].message.content).toBeNull();
-    expect(result.choices[0].message.tool_calls?.[0].function.name).toBe('get_weather');
+    expect(result.choices[0].message.tool_calls).toEqual(toolCalls);
+    expect(result.choices[0].message).not.toHaveProperty('reasoning_content');
+    expect(result.choices[0].finish_reason).toBe('tool_calls');
   });
 
   it('leaves real string content untouched', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'id', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: 'normal answer', reasoning_content: 'should not override' },
-          finish_reason: 'stop',
-        }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any);
-
-    const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
-    expect(result.choices[0].message.content).toBe('normal answer');
+    const result = await completeMessage({
+      content: 'مرحبا بك', reasoning_content: 'synthetic private block', reasoning: 'synthetic private block',
+    });
+    expect(result.choices[0].message.content).toBe('مرحبا بك');
+    expect(result.choices[0].message).not.toHaveProperty('reasoning_content');
+    expect(result.choices[0].message).not.toHaveProperty('reasoning');
   });
+
+  it('streams only final text while removing all private side channels', async () => {
+    const chunks = await streamDeltas([
+      { role: 'assistant', reasoning_content: 'synthetic private block', reasoning: 'synthetic private block' },
+      { thinking: 'synthetic private block', thinking_content: 'synthetic private block',
+        thinking_blocks: [], reasoning_details: [], analysis: 'synthetic private block',
+        analysis_content: 'synthetic private block' },
+      { content: 'مرحبا', reasoning_content: 'synthetic private block' },
+      { content: [{ type: 'thinking', text: 'synthetic private block' },
+        { type: 'reasoning', text: 'synthetic private block' },
+        { type: 'analysis', text: 'synthetic private block' },
+        { type: 'text', text: ' ' }, 'بك', { text: 'untyped block' }, null] },
+    ]);
+    expect(chunks).toHaveLength(4);
+    expect(chunks[0].choices[0].delta).toEqual({ role: 'assistant' });
+    expect(chunks[1].choices[0].delta).toEqual({});
+    expect(chunks[2].choices[0].delta).toEqual({ content: 'مرحبا' });
+    expect(chunks[3].choices[0].delta).toEqual({ content: ' بك' });
+    expect(chunks[3].choices[0].finish_reason).toBe('stop');
+  });
+
+  it('preserves null streaming content and length without substituting reasoning', async () => {
+    const chunks = await streamDeltas([{ content: null, reasoning_content: 'synthetic private block' }], 'length');
+    expect(chunks[0].choices[0].delta).toEqual({ content: null });
+    expect(chunks[0].choices[0].finish_reason).toBe('length');
+  });
+
+  it('preserves streamed tool calls and null content while stripping reasoning', async () => {
+    const toolCalls = [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }];
+    const chunks = await streamDeltas([{
+      content: null, tool_calls: toolCalls, reasoning: 'synthetic private block',
+    }], 'tool_calls');
+    expect(chunks[0].choices[0].delta).toEqual({ content: null, tool_calls: toolCalls });
+    expect(chunks[0].choices[0].finish_reason).toBe('tool_calls');
+  });
+
+  for (const streaming of [false, true]) {
+    it.each([
+      { platform: 'openrouter', model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+        reasoning: { exclude: true, enabled: false } },
+      { platform: 'openrouter', model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
+        reasoning: { exclude: true, enabled: false } },
+      { platform: 'openrouter', model: 'ordinary-model', reasoning: { exclude: true } },
+      { platform: 'openrouter', model: 'nvidia/another-reasoning-model:free', reasoning: { exclude: true } },
+      { platform: 'groq', model: 'ordinary-model', reasoning: undefined },
+      { platform: 'nvidia', model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', reasoning: undefined },
+    ])(`uses scoped reasoning defaults for $platform / $model (stream=${streaming})`, async (testCase) => {
+      const instance = new OpenAICompatProvider({
+        platform: testCase.platform as 'openrouter' | 'groq' | 'nvidia',
+        name: 'TestProvider', baseUrl: 'https://api.test.com/v1',
+      });
+      let body: any;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        body = JSON.parse(init!.body as string);
+        return new Response(streaming ? 'data: [DONE]\n\n' : JSON.stringify({
+          id: 'id', object: 'chat.completion', created: 1, model: testCase.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }));
+      });
+
+      const messages = [{ role: 'user' as const, content: 'hi' }];
+      if (streaming) {
+        for await (const _chunk of instance.streamChatCompletion('k', messages, testCase.model, { max_tokens: 450 })) {
+          // Consume the mocked SSE response to send the request.
+        }
+      } else {
+        await instance.chatCompletion('k', messages, testCase.model, { max_tokens: 450 });
+      }
+      expect(body.reasoning).toEqual(testCase.reasoning);
+      if (testCase.reasoning === undefined) expect(body).not.toHaveProperty('reasoning');
+      expect(body.max_tokens).toBe(450);
+      expect(body.stream).toBe(streaming ? true : undefined);
+    });
+  }
 });
 
 describe('OpenAICompatProvider - platform instances', () => {

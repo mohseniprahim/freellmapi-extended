@@ -50,6 +50,17 @@ export class OpenAICompatProvider extends BaseProvider {
     return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
   }
 
+  /** Hide OpenRouter reasoning; disable it only for the verified optional-
+   * thinking Nemotron Omni model, never for models with mandatory reasoning. */
+  private reasoningOptions(modelId: string): { exclude: true; enabled?: false } | undefined {
+    if (this.platform !== 'openrouter') return undefined;
+    if (modelId === 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free'
+      || modelId === 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning') {
+      return { exclude: true, enabled: false };
+    }
+    return { exclude: true };
+  }
+
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -73,6 +84,7 @@ export class OpenAICompatProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
         response_format: options?.response_format,
+        reasoning: this.reasoningOptions(modelId),
       }),
     }, options?.timeoutMs ?? this.timeoutMs);
 
@@ -110,6 +122,7 @@ export class OpenAICompatProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
         response_format: options?.response_format,
+        reasoning: this.reasoningOptions(modelId),
         stream: true,
       }),
     }, options?.timeoutMs ?? this.timeoutMs);
@@ -139,7 +152,9 @@ export class OpenAICompatProvider extends BaseProvider {
         const data = trimmed.slice(6);
         if (data === '[DONE]') return;
         try {
-          yield JSON.parse(data) as ChatCompletionChunk;
+          const chunk = JSON.parse(data) as ChatCompletionChunk;
+          normalizeChoices(chunk);
+          yield chunk;
         } catch {
           // Skip malformed chunks
         }
@@ -237,38 +252,39 @@ export class OpenAICompatProvider extends BaseProvider {
 }
 
 /**
- * Some providers (Z.ai glm-4.5-flash, Cloudflare DeepSeek-R1-distill, others)
- * return reasoning models' actual answer in `message.reasoning_content` with
- * `message.content === ""`. Fold reasoning_content into content so OpenAI-
- * compatible clients see a non-empty assistant message.
- *
- * Other providers (Mistral magistral-medium) return `message.content` as an
- * array of text segments instead of a string. Flatten to string.
+ * Normalize only final-answer text, for both complete messages and stream
+ * deltas. Reasoning is never a substitute for an empty/truncated answer.
  */
-function normalizeChoices(data: ChatCompletionResponse): void {
+function normalizeChoices(data: ChatCompletionResponse | ChatCompletionChunk): void {
   for (const choice of data.choices ?? []) {
-    const msg = choice.message as ChatMessage & {
-      reasoning_content?: string;
-      reasoning?: string;
-      content: unknown;
-    };
-    // Flatten array content (Mistral magistral) → join text segments.
-    if (Array.isArray(msg.content)) {
-      msg.content = (msg.content as Array<{ text?: string; type?: string }>)
-        .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
-        .join('');
-    }
-    // Fold reasoning into content if content is empty AND there are no
-    // tool_calls. With tool_calls present, content=null is the correct OpenAI
-    // shape; folding reasoning would confuse clients that branch on content.
-    // Field naming varies by provider: Z.ai uses `reasoning_content`, Ollama
-    // uses `reasoning`. Prefer `reasoning_content` when both are set.
-    const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-    if (!hasToolCalls && (msg.content === '' || msg.content == null)) {
-      const fold = (typeof msg.reasoning_content === 'string' && msg.reasoning_content.length > 0)
-        ? msg.reasoning_content
-        : (typeof msg.reasoning === 'string' && msg.reasoning.length > 0 ? msg.reasoning : null);
-      if (fold !== null) msg.content = fold;
-    }
+    normalizeAssistantContent('message' in choice ? choice.message : choice.delta);
+  }
+}
+
+function normalizeAssistantContent(message: unknown): void {
+  if (!message || typeof message !== 'object') return;
+  const msg = message as Record<string, unknown>;
+
+  // Some providers return mixed text/thinking blocks. Only explicitly typed
+  // text blocks or plain strings belong in customer-facing final content.
+  if (Array.isArray(msg.content)) {
+    msg.content = msg.content.map(seg => {
+      if (typeof seg === 'string') return seg;
+      if (seg && typeof seg === 'object' && seg.type === 'text' && typeof seg.text === 'string') {
+        return seg.text;
+      }
+      return '';
+    }).join('');
+  }
+
+  // Remove provider-private side channels so compatible clients cannot
+  // accidentally display them. Preserve content=null (including tool calls),
+  // absent stream content, tool_calls, finish_reason and other metadata.
+  for (const field of [
+    'reasoning_content', 'reasoning', 'reasoning_details',
+    'thinking', 'thinking_content', 'thinking_blocks',
+    'analysis', 'analysis_content',
+  ]) {
+    delete msg[field];
   }
 }
