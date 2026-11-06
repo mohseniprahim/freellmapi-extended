@@ -2496,7 +2496,44 @@ export function getUnifiedApiKey(): string {
 export function regenerateUnifiedKey(): string {
   const db = getDb();
   const key = `myllm-${crypto.randomBytes(24).toString('hex')}`;
-  db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+  const hash = crypto.createHash('sha256').update(key).digest('hex');
+  let encrypted: string | null = null;
+  let iv: string | null = null;
+  let authTag: string | null = null;
+  try {
+    const enc = encrypt(key);
+    encrypted = enc.encrypted;
+    iv = enc.iv;
+    authTag = enc.authTag;
+  } catch { /* authentication still works from the hash if encryption is unavailable */ }
+
+  const regenerate = db.transaction(() => {
+    const previous = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as
+      { value: string } | undefined;
+    const previousHash = previous?.value
+      ? crypto.createHash('sha256').update(previous.value).digest('hex')
+      : null;
+    const mapped = previousHash
+      ? db.prepare('SELECT id FROM client_keys WHERE key_hash = ? AND deleted_at IS NULL').get(previousHash) as
+          { id: number } | undefined
+      : undefined;
+
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+    if (mapped) {
+      db.prepare(`
+        UPDATE client_keys
+           SET key_hash = ?, key_prefix = ?, enabled = 1,
+               encrypted_key = ?, iv = ?, auth_tag = ?, deleted_at = NULL
+         WHERE id = ?
+      `).run(hash, key.slice(0, 16), encrypted, iv, authTag, mapped.id);
+    } else {
+      db.prepare(`
+        INSERT INTO client_keys (name, key_hash, key_prefix, enabled, encrypted_key, iv, auth_tag)
+        VALUES ('Unified API key', ?, ?, 1, ?, ?, ?)
+      `).run(hash, key.slice(0, 16), encrypted, iv, authTag);
+    }
+  });
+  regenerate();
   return key;
 }
 

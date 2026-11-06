@@ -1,7 +1,15 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getDb, getUnifiedApiKey, authenticateApiKey } from '../../db/index.js';
+import {
+  initDb,
+  getDb,
+  getUnifiedApiKey,
+  regenerateUnifiedKey,
+  authenticateApiKey,
+  revealClientKey,
+} from '../../db/index.js';
 
 async function req(app: Express, method: string, path: string, body?: any) {
   const server = app.listen(0);
@@ -116,5 +124,34 @@ describe('Client Keys CRUD', () => {
   it('GET /:id/reveal returns 404 for a missing row', async () => {
     const reveal = await req(app, 'GET', '/api/client-keys/99999/reveal');
     expect(reveal.status).toBe(404);
+  });
+
+  it('regenerating the unified key keeps Default auth and reveal in sync', () => {
+    const previous = getUnifiedApiKey();
+    const regenerated = regenerateUnifiedKey();
+
+    expect(regenerated).not.toBe(previous);
+    expect(authenticateApiKey(previous)).toBeNull();
+    expect(authenticateApiKey(regenerated)).toEqual({ id: 1, name: 'Default' });
+    expect(revealClientKey(1)).toBe(regenerated);
+  });
+
+  it('registers a separate unified key without replacing a distinct Default client key', () => {
+    const separateDefault = `myllm-${'a'.repeat(48)}`;
+    const separateHash = createHash('sha256').update(separateDefault).digest('hex');
+    getDb().prepare('UPDATE client_keys SET key_hash = ?, key_prefix = ? WHERE id = 1')
+      .run(separateHash, separateDefault.slice(0, 16));
+
+    const regenerated = regenerateUnifiedKey();
+    const unifiedHash = createHash('sha256').update(regenerated).digest('hex');
+    const unifiedRow = getDb().prepare('SELECT id, name FROM client_keys WHERE key_hash = ?')
+      .get(unifiedHash) as { id: number; name: string } | undefined;
+
+    expect(unifiedRow).toBeDefined();
+    expect(unifiedRow?.id).not.toBe(1);
+    expect(unifiedRow?.name).toBe('Unified API key');
+    expect(authenticateApiKey(regenerated)).toEqual({ id: unifiedRow!.id, name: 'Unified API key' });
+    expect(authenticateApiKey(separateDefault)).toEqual({ id: 1, name: 'Default' });
+    expect(revealClientKey(unifiedRow!.id)).toBe(regenerated);
   });
 });
