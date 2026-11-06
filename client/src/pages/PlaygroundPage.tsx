@@ -78,6 +78,13 @@ export default function PlaygroundPage() {
   const handleSend = async () => {
     const text = input.trim()
     if (!text || loading) return
+    if (!apiKey) {
+      setMessages([...messages, {
+        role: 'assistant',
+        content: 'Error: The API key is still loading. Wait a moment and try again.',
+      }])
+      return
+    }
 
     const userMsg: ChatMessage = { role: 'user', content: text }
     const newMessages = [...messages, userMsg]
@@ -87,8 +94,10 @@ export default function PlaygroundPage() {
     inputRef.current?.focus()
 
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      }
 
       const body: any = {
         messages: newMessages.map(m => ({ role: m.role, content: m.content })),
