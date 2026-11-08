@@ -195,6 +195,7 @@ export function routeRequest(
   // timeout retrying its other keys against the same dead endpoint.
   skipModels?: Set<number>,
   cascadeOptions?: ChatCascadeOptions,
+  requireAudio = false,
 ): RouteResult {
   const db = getDb();
 
@@ -285,6 +286,7 @@ export function routeRequest(
       whereParts.push("(modality = 'text' OR modality IS NULL)");
     }
     if (requireVision)    whereParts.push('vision_capable = 1');
+    if (requireAudio)     whereParts.push('audio_capable = 1');
     if (requireJsonMode)  whereParts.push('supports_json_mode = 1', 'is_reasoning = 0');
     if (excludeReasoning && !requireJsonMode && !reasoningFallback) whereParts.push('is_reasoning = 0');
     const model = db.prepare(

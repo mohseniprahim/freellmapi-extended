@@ -181,7 +181,8 @@ export interface AudioTranscriptionResponse {
 
 export type ChatContentPart =
   | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } }
+  | { type: 'input_audio'; input_audio: { data: string; format: 'wav' | 'mp3' | 'ogg' | 'm4a' } };
 
 export type ChatMessageContent = string | ChatContentPart[];
 

@@ -16,6 +16,7 @@ import {
   isBadRequestError,
   normalizeMessages,
   estimateMessageTokens,
+  isAudioInput,
   resolvePreferredModel,
   resolveAlias,
   setStickyModel,
@@ -154,6 +155,7 @@ async function handleStreamingCompletion(
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
   const requireVision = messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'));
+  const requireAudio = isAudioInput(messages);
   const requireJsonMode = response_format != null
     && (response_format.type === 'json_object' || response_format.type === 'json_schema');
 
@@ -208,11 +210,11 @@ async function handleStreamingCompletion(
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys, preferredModel, requireVision, requireJsonMode, excludeReasoning, 'text', undefined, aliasChain, aliasPlatforms, skipModels, {
-        platformAttempts, allowReasoningFallback,
-        preferReasoningFallback: allowReasoningFallback && attempt === maxRetries - 1,
-        strictModelDbId: data.no_cascade && data.model && !alias ? preferredModel : undefined,
-      });
+    route = routeRequest(estimatedTotal, skipKeys, preferredModel, requireVision, requireJsonMode, excludeReasoning, 'text', undefined, aliasChain, aliasPlatforms, skipModels, {
+      platformAttempts, allowReasoningFallback,
+      preferReasoningFallback: allowReasoningFallback && attempt === maxRetries - 1,
+      strictModelDbId: data.no_cascade && data.model && !alias ? preferredModel : undefined,
+    }, requireAudio);
     } catch (err: any) {
       if (lastError) {
         endWithError(429, `All models rate-limited. Last error: ${lastError.message}`, 'rate_limit_error');

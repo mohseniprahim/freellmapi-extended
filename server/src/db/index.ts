@@ -113,6 +113,7 @@ export function initDb(dbPath?: string): Database.Database {
   migratePricingV58FlashLiteDefault(db);
   migrateModelsV59KiloGemma4(db);
   migrateModelsV60MediaRouting(db);
+  migrateModelsV61AudioChat(db);
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
@@ -2793,6 +2794,24 @@ function migrateModelsV60MediaRouting(db: Database.Database) {
     try { db.exec(`ALTER TABLE models ADD COLUMN ${name} ${type}`); }
     catch (e: any) { if (!(e?.message ?? '').includes('duplicate column')) throw e; }
   }
+}
+
+/** V61 — register a chat model that accepts OpenAI input_audio parts. */
+function migrateModelsV61AudioChat(db: Database.Database) {
+  db.prepare(`
+    INSERT OR IGNORE INTO models (
+      platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+      rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+      enabled, modality, supports_json_mode, is_reasoning, audio_capable
+    ) VALUES ('openrouter', 'openai/gpt-4o-audio-preview', 'GPT-4o Audio (OpenRouter · PAID)',
+      2, 6, 'Frontier', 10, null, null, null, 'paid · provider billing', 128000,
+      1, 'text', 0, 0, 1)
+  `).run();
+  const row = db.prepare("SELECT id FROM models WHERE platform='openrouter' AND model_id='openai/gpt-4o-audio-preview'").get() as { id: number } | undefined;
+  if (!row) return;
+  db.prepare('UPDATE models SET audio_capable = 1, enabled = 1 WHERE id = ?').run(row.id);
+  db.prepare(`INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
+              VALUES (?, (SELECT COALESCE(MIN(priority), 1) - 1 FROM fallback_config), 1)`).run(row.id);
 }
 
 function migrateModelsV59KiloGemma4(db: Database.Database) {

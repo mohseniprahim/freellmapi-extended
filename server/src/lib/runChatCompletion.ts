@@ -48,7 +48,15 @@ const imageUrlPartSchema = z.object({
   }),
 });
 
-const contentPartSchema = z.union([textPartSchema, imageUrlPartSchema]);
+const inputAudioPartSchema = z.object({
+  type: z.literal('input_audio'),
+  input_audio: z.object({
+    data: z.string().min(1),
+    format: z.enum(['wav', 'mp3', 'ogg', 'm4a']),
+  }),
+});
+
+const contentPartSchema = z.union([textPartSchema, imageUrlPartSchema, inputAudioPartSchema]);
 
 const userMessageSchema = z.object({
   role: z.literal('user'),
@@ -343,6 +351,10 @@ export function isMultimodal(messages: ChatMessage[]): boolean {
   return messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url'));
 }
 
+export function isAudioInput(messages: ChatMessage[]): boolean {
+  return messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'input_audio'));
+}
+
 export function countImageParts(messages: ChatMessage[]): number {
   let n = 0;
   for (const m of messages) {
@@ -368,6 +380,7 @@ export function estimateMessageTokens(messages: ChatMessage[]): number {
       for (const p of m.content) {
         if (p.type === 'text') n += Math.ceil(p.text.length / 4);
         else if (p.type === 'image_url') n += estimateImageTokens(p);
+        else if (p.type === 'input_audio') n += Math.ceil(p.input_audio.data.length / 16);
       }
     }
   }
@@ -613,6 +626,7 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
   const estimatedInputTokens = estimateMessageTokens(messages);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
   const requireVision = isMultimodal(messages);
+  const requireAudio = isAudioInput(messages);
   const requireJsonMode = requiresJsonMode(response_format);
   const responseFormatType = response_format?.type ?? null;
   // Per-request id (lightweight; collisions in DB index OK). Lets us join
@@ -653,7 +667,7 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
         platformAttempts, allowReasoningFallback,
         preferReasoningFallback: allowReasoningFallback && attempt === maxRetries - 1,
         strictModelDbId: parsed.no_cascade && requestedModel && !alias ? preferredModel : undefined,
-      });
+      }, requireAudio);
     } catch (err: any) {
       if (lastError) throw new AllProvidersFailedError(lastError.message);
       throw new RoutingError(err.message, err.status ?? 503);
