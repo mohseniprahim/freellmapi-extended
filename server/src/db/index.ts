@@ -114,6 +114,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV59KiloGemma4(db);
   migrateModelsV60MediaRouting(db);
   migrateModelsV61AudioChat(db);
+  migrateModelsV62FreeAudioChat(db);
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
@@ -2813,6 +2814,41 @@ function migrateModelsV61AudioChat(db: Database.Database) {
   db.prepare('UPDATE models SET price_input_per_1m = 2.5, price_output_per_1m = 10 WHERE id = ?').run(row.id);
   db.prepare(`INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
               VALUES (?, (SELECT COALESCE(MIN(priority), 1) - 1 FROM fallback_config), 1)`).run(row.id);
+}
+
+/** V62 — verified free OpenRouter models that accept audio in chat and return text. */
+function migrateModelsV62FreeAudioChat(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (
+      platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+      monthly_token_budget, context_window, enabled, modality, supports_json_mode,
+      is_reasoning, audio_capable, audio_routing_enabled, price_input_per_1m,
+      price_output_per_1m
+    ) VALUES ('openrouter', ?, ?, ?, ?, ?, ?, ?, 1, 'text', 0, 0, 1, 1, 0, 0)
+  `);
+  insert.run('nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    'NVIDIA Nemotron 3 Nano Omni (free)', 1, 4, 'Omni', '~free', 262144);
+  insert.run('stealth/crouton-alpha', 'Crouton Alpha (free · audio)',
+    2, 5, 'Multimodal', '~free', 131072);
+
+  const rows = db.prepare(`
+    SELECT id FROM models WHERE platform = 'openrouter'
+      AND model_id IN (?, ?)
+  `).all('nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    'stealth/crouton-alpha') as Array<{ id: number }>;
+  const addFallback = db.prepare(`
+    INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
+    VALUES (?, (SELECT COALESCE(MAX(priority), 0) + 1 FROM fallback_config), 1)
+  `);
+  const update = db.prepare(`
+    UPDATE models SET modality = 'text', audio_capable = 1,
+      audio_routing_enabled = 1, price_input_per_1m = 0,
+      price_output_per_1m = 0, enabled = 1 WHERE id = ?
+  `);
+  for (const row of rows) {
+    update.run(row.id);
+    addFallback.run(row.id);
+  }
 }
 
 function migrateModelsV59KiloGemma4(db: Database.Database) {
