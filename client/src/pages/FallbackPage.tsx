@@ -41,6 +41,9 @@ interface FallbackEntry {
   keyCount: number
   modality: string
   visionCapable: boolean
+  audioCapable: boolean
+  imageRoutingEnabled: boolean
+  audioRoutingEnabled: boolean
   supportsImg2Img: boolean
   supportsInpainting: boolean
   supportsJsonMode: boolean
@@ -213,10 +216,12 @@ function SortableModelRow({
   entry,
   index,
   onToggle,
+  onMediaToggle,
 }: {
   entry: FallbackEntry
   index: number
   onToggle: (modelDbId: number, enabled: boolean) => void
+  onMediaToggle: (modelDbId: number, kind: 'image' | 'audio', enabled: boolean) => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: entry.modelDbId,
@@ -282,6 +287,14 @@ function SortableModelRow({
           </span>
         </div>
       </div>
+      <div className="hidden md:flex items-center gap-2 text-[10px] text-muted-foreground">
+        {entry.visionCapable && <label className="flex items-center gap-1" title="Allow this model to receive image messages">
+          <span>Images</span><Switch className="scale-75" checked={entry.imageRoutingEnabled} onCheckedChange={(v) => onMediaToggle(entry.modelDbId, 'image', v)} />
+        </label>}
+        {entry.audioCapable && <label className="flex items-center gap-1" title="Allow this model to receive audio messages">
+          <span>Audio</span><Switch className="scale-75" checked={entry.audioRoutingEnabled} onCheckedChange={(v) => onMediaToggle(entry.modelDbId, 'audio', v)} />
+        </label>}
+      </div>
       <Switch
         checked={entry.enabled}
         onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)}
@@ -305,7 +318,7 @@ export default function FallbackPage() {
   })
 
   const saveMutation = useMutation({
-    mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean }[]) =>
+    mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean; imageRoutingEnabled: boolean; audioRoutingEnabled: boolean }[]) =>
       apiFetch('/api/fallback', { method: 'PUT', body: JSON.stringify(data) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
@@ -322,9 +335,19 @@ export default function FallbackPage() {
     },
   })
 
+  const syncOpenRouterMutation = useMutation({
+    mutationFn: () => apiFetch('/api/models/sync-openrouter', { method: 'POST' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+
   const allEntries = localEntries ?? entries
-  const displayEntries = allEntries.filter(e => e.keyCount > 0)
-  const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
+  // Never hide catalog rows just because a provider key is missing. Paid
+  // OpenRouter models must remain visible so the operator can configure them.
+  const displayEntries = allEntries
+  const unconfiguredPlatforms: string[] = []
 
   const sensors = useSensors(
     useSensor(PointerSensor),
@@ -352,6 +375,12 @@ export default function FallbackPage() {
     setLocalEntries(updated)
   }
 
+  function handleMediaToggle(modelDbId: number, kind: 'image' | 'audio', enabled: boolean) {
+    setLocalEntries(allEntries.map(e => e.modelDbId === modelDbId
+      ? (kind === 'image' ? { ...e, imageRoutingEnabled: enabled } : { ...e, audioRoutingEnabled: enabled })
+      : e))
+  }
+
   function handleSave() {
     if (!localEntries) return
     saveMutation.mutate(
@@ -359,6 +388,8 @@ export default function FallbackPage() {
         modelDbId: e.modelDbId,
         priority: e.priority,
         enabled: e.enabled,
+        imageRoutingEnabled: e.imageRoutingEnabled,
+        audioRoutingEnabled: e.audioRoutingEnabled,
       }))
     )
   }
@@ -372,6 +403,9 @@ export default function FallbackPage() {
         description="Drag to reorder. Requests try models top-to-bottom until one succeeds."
         actions={
           <>
+            <Button variant="outline" size="sm" onClick={() => syncOpenRouterMutation.mutate()} disabled={syncOpenRouterMutation.isPending}>
+              {syncOpenRouterMutation.isPending ? 'Syncing OpenRouter…' : 'Sync OpenRouter models'}
+            </Button>
             <Button variant="default" size="sm" onClick={() => sortMutation.mutate('quality')} disabled={sortMutation.isPending}>
               Sort by quality
             </Button>
@@ -590,6 +624,7 @@ export default function FallbackPage() {
                       entry={entry}
                       index={index}
                       onToggle={handleToggle}
+                      onMediaToggle={handleMediaToggle}
                     />
                   ))}
                 </SortableContext>

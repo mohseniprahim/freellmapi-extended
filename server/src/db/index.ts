@@ -112,6 +112,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateEndUserLimitsV56(db);
   migratePricingV58FlashLiteDefault(db);
   migrateModelsV59KiloGemma4(db);
+  migrateModelsV60MediaRouting(db);
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
@@ -2781,6 +2782,19 @@ function migratePricingV58FlashLiteDefault(db: Database.Database) {
  * generic fallback backfill); applyQualityOrder (V57, runs last) re-sorts them
  * by measured health once traffic arrives.
  */
+/** V60 — operator-controlled media routing flags for every model row. */
+function migrateModelsV60MediaRouting(db: Database.Database) {
+  const cols: Array<[string, string]> = [
+    ['audio_capable', 'INTEGER NOT NULL DEFAULT 0'],
+    ['image_routing_enabled', 'INTEGER NOT NULL DEFAULT 1'],
+    ['audio_routing_enabled', 'INTEGER NOT NULL DEFAULT 1'],
+  ];
+  for (const [name, type] of cols) {
+    try { db.exec(`ALTER TABLE models ADD COLUMN ${name} ${type}`); }
+    catch (e: any) { if (!(e?.message ?? '').includes('duplicate column')) throw e; }
+  }
+}
+
 function migrateModelsV59KiloGemma4(db: Database.Database) {
   const ins = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,

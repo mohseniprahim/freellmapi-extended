@@ -15,6 +15,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.monthly_token_budget, m.modality, m.vision_capable,
+           m.audio_capable, m.image_routing_enabled, m.audio_routing_enabled,
            m.supports_img2img, m.supports_inpainting, m.supports_json_mode,
            m.is_reasoning, m.price_input_per_1m, m.price_output_per_1m,
            m.price_per_call
@@ -55,6 +56,9 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       monthlyTokenBudget: r.monthly_token_budget,
       modality: r.modality ?? 'text',
       visionCapable: r.vision_capable === 1,
+      audioCapable: r.audio_capable === 1,
+      imageRoutingEnabled: r.image_routing_enabled !== 0,
+      audioRoutingEnabled: r.audio_routing_enabled !== 0,
       supportsImg2Img: r.supports_img2img === 1,
       supportsInpainting: r.supports_inpainting === 1,
       supportsJsonMode: r.supports_json_mode === 1,
@@ -74,6 +78,8 @@ const updateSchema = z.array(z.object({
   modelDbId: z.number(),
   priority: z.number(),
   enabled: z.boolean(),
+  imageRoutingEnabled: z.boolean().optional(),
+  audioRoutingEnabled: z.boolean().optional(),
 }));
 
 // Update fallback chain (full replace)
@@ -88,10 +94,19 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
   const update = db.prepare(`
     UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?
   `);
+  const updateMedia = db.prepare(`
+    UPDATE models SET image_routing_enabled = COALESCE(?, image_routing_enabled),
+      audio_routing_enabled = COALESCE(?, audio_routing_enabled) WHERE id = ?
+  `);
 
   const updateAll = db.transaction(() => {
     for (const entry of parsed.data) {
       update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
+      updateMedia.run(
+        entry.imageRoutingEnabled == null ? null : (entry.imageRoutingEnabled ? 1 : 0),
+        entry.audioRoutingEnabled == null ? null : (entry.audioRoutingEnabled ? 1 : 0),
+        entry.modelDbId,
+      );
     }
   });
   updateAll();
