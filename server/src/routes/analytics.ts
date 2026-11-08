@@ -233,16 +233,19 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
 
   // dateFormat is a hardcoded whitelist — never user-controlled.
   const dateFormat = interval === 'hour' ? '%Y-%m-%dT%H:00:00' : '%Y-%m-%d';
+  // SQLite stores UTC; Saudi Arabia is UTC+3 year-round. Keep storage UTC
+  // and convert only the report bucket labels.
+  const reportTime = `datetime(created_at, '+3 hours')`;
 
   const rows = db.prepare(`
     SELECT
-      strftime('${dateFormat}', created_at) as timestamp,
+      strftime('${dateFormat}', ${reportTime}) as timestamp,
       COUNT(*) as requests,
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failure_count
     FROM requests
     WHERE created_at >= ?
-    GROUP BY strftime('${dateFormat}', created_at)
+    GROUP BY strftime('${dateFormat}', ${reportTime})
     ORDER BY timestamp ASC
   `).all(since) as any[];
 

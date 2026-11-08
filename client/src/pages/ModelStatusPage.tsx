@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { formatSaudiDateTime } from '@/lib/date'
 
 type Row = {
   platform: string
@@ -52,7 +53,7 @@ export default function ModelStatusPage() {
           <h1 className="text-xl font-semibold tracking-tight">Model Status</h1>
           <p className="text-sm text-muted-foreground">
             Auto-tested once a day. Last run:{' '}
-            {d.generatedAt ? new Date(d.generatedAt).toLocaleString() : 'never'}
+            {d.generatedAt ? formatSaudiDateTime(d.generatedAt) : 'never'}
           </p>
         </div>
         <button
@@ -124,7 +125,7 @@ export default function ModelStatusPage() {
           <h2 className="text-sm font-semibold">
             Upstream scan{' '}
             <span className="text-muted-foreground font-normal">
-              ({new Date(up.generatedAt).toLocaleString()}) · new {totalNew} · gone {totalGone}
+              ({formatSaudiDateTime(up.generatedAt)}) · new {totalNew} · gone {totalGone}
             </span>
           </h2>
           <div className="rounded border divide-y">

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { formatSaudiDateTime } from '@/lib/date'
 
 type RequestCounts = { total: number; completed: number; failed: number }
 type Batch = {
@@ -141,7 +142,7 @@ export default function BatchesPage() {
                     <td className="px-3 py-2 w-48"><ProgressBar counts={b.request_counts} /></td>
                     <td className="px-3 py-2 text-xs">{b.priority}</td>
                     <td className="px-3 py-2 text-xs">{source}</td>
-                    <td className="px-3 py-2 text-xs">{new Date(b.created_at + 'Z').toLocaleString()}</td>
+                    <td className="px-3 py-2 text-xs">{formatSaudiDateTime(b.created_at)}</td>
                     <td className="px-3 py-2 text-xs">{elapsed(b.created_at, b.finished_at)}</td>
                     <td className="px-3 py-2 text-xs">
                       <button
@@ -227,11 +228,11 @@ function BatchDetail({ batch, onClose }: { batch: Batch; onClose: () => void }) 
           <dt className="text-muted-foreground">Priority</dt>
           <dd>{batch.priority}</dd>
           <dt className="text-muted-foreground">Created</dt>
-          <dd className="text-xs">{new Date(batch.created_at + 'Z').toLocaleString()}</dd>
+          <dd className="text-xs">{formatSaudiDateTime(batch.created_at)}</dd>
           {batch.finished_at && (
             <>
               <dt className="text-muted-foreground">Finished</dt>
-              <dd className="text-xs">{new Date(batch.finished_at + 'Z').toLocaleString()}</dd>
+              <dd className="text-xs">{formatSaudiDateTime(batch.finished_at)}</dd>
             </>
           )}
           {batch.callback_url && (

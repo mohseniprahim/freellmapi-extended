@@ -6,6 +6,7 @@ import {
 } from 'recharts'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { formatSaudiDateTime } from '@/lib/date'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
 
@@ -297,7 +298,7 @@ export default function AnalyticsPage() {
                         return (
                           <TableRow key={row.id}>
                             <TableCell className="pl-4 text-xs whitespace-nowrap">
-                              {new Date(row.createdAt).toLocaleString()}
+                              {formatSaudiDateTime(row.createdAt)}
                             </TableCell>
                             <TableCell>
                               <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${kindClass}`}>{kindLabel}</span>

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { formatSaudiDateTime } from '@/lib/date'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -22,8 +23,7 @@ interface CreatedClientKey extends ClientKey {
 
 function formatDate(iso: string | null): string {
   if (!iso) return '—'
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z')
-  return d.toLocaleString('en-US', { dateStyle: 'short', timeStyle: 'short' })
+  return formatSaudiDateTime(iso)
 }
 
 export default function ApiKeysPage() {

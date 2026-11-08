@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { formatSaudiDateTime, formatSaudiTime } from '@/lib/date'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -313,14 +314,14 @@ export default function KeysPage() {
                                 k.daysUntilExpiry < 30  ? 'bg-amber-100 text-amber-700' :
                                 'bg-muted text-muted-foreground'
                               }`}
-                              title={k.expiresAt ? `Expires ${new Date(k.expiresAt + 'Z').toLocaleString()}` : 'No expiry'}
+                              title={k.expiresAt ? `Expires ${formatSaudiDateTime(k.expiresAt)}` : 'No expiry'}
                             >
                               {k.daysUntilExpiry < 0 ? 'expired' : `${k.daysUntilExpiry}d left`}
                             </span>
                           )}
                           {lastChecked && (
                             <span className="text-[11px] text-muted-foreground tabular-nums">
-                              {new Date(lastChecked).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              {formatSaudiTime(lastChecked)}
                             </span>
                           )}
                           <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending}>
