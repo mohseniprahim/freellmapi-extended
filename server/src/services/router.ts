@@ -258,6 +258,23 @@ export function routeRequest(
     });
   }
 
+  // Audio policy: never spend on a paid audio model while an enabled free
+  // audio model is available. Manual priority still orders models within each
+  // price group. A model is treated as paid only when its catalog has a
+  // positive input/output price.
+  if (requireAudio) {
+    const pricing = new Map((db.prepare(
+      'SELECT id, COALESCE(price_input_per_1m, 0) AS input_price, COALESCE(price_output_per_1m, 0) AS output_price FROM models'
+    ).all() as Array<{ id: number; input_price: number; output_price: number }>).map(m => [m.id, m]));
+    sortedChain.sort((a, b) => {
+      const pa = pricing.get(a.model_db_id);
+      const pb = pricing.get(b.model_db_id);
+      const aPaid = Number((pa?.input_price ?? 0) > 0 || (pa?.output_price ?? 0) > 0);
+      const bPaid = Number((pb?.input_price ?? 0) > 0 || (pb?.output_price ?? 0) > 0);
+      return aPaid - bPaid;
+    });
+  }
+
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
     if (skipModels?.has(entry.model_db_id)) continue;

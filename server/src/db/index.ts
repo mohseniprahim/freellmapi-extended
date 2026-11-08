@@ -2810,6 +2810,7 @@ function migrateModelsV61AudioChat(db: Database.Database) {
   const row = db.prepare("SELECT id FROM models WHERE platform='openrouter' AND model_id='openai/gpt-4o-audio-preview'").get() as { id: number } | undefined;
   if (!row) return;
   db.prepare('UPDATE models SET audio_capable = 1, enabled = 1 WHERE id = ?').run(row.id);
+  db.prepare('UPDATE models SET price_input_per_1m = 2.5, price_output_per_1m = 10 WHERE id = ?').run(row.id);
   db.prepare(`INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
               VALUES (?, (SELECT COALESCE(MIN(priority), 1) - 1 FROM fallback_config), 1)`).run(row.id);
 }
