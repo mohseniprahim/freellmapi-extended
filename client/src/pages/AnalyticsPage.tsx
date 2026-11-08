@@ -102,7 +102,19 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
   })
 
-  const { data: byKey = [] } = useQuery({
+  const { data: byKey = [] } = useQuery<Array<{
+      clientKeyId: number | null
+      name: string
+      totalRequests: number
+      successCount: number
+      errorCount: number
+      cascadeCount: number
+      totalInputTokens: number
+      totalOutputTokens: number
+      avgLatencyMs: number
+      imagesGenerated: number
+      costUsd: number
+  }>>({
     queryKey: ['analytics', 'by-key', range],
     queryFn: () => apiFetch<Array<{
       clientKeyId: number | null
@@ -117,6 +129,22 @@ export default function AnalyticsPage() {
       imagesGenerated: number
       costUsd: number
     }>>(`/api/analytics/by-key?range=${range}`),
+  })
+
+  const { data: byProviderKey = [] } = useQuery<Array<{
+    platform: string
+    keyId: number | null
+    label: string
+    totalRequests: number
+    successCount: number
+    errorCount: number
+    inputTokens: number
+    outputTokens: number
+    modelCount: number
+    lastUsed: string | null
+  }>>({
+    queryKey: ['analytics', 'by-provider-key', range],
+    queryFn: () => apiFetch('/api/analytics/by-provider-key?range=' + range),
   })
 
   return (
@@ -403,6 +431,44 @@ export default function AnalyticsPage() {
                       </TableRow>
                     )
                   })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Usage by provider API key">
+          <p className="text-xs text-muted-foreground mb-3">
+            Actual upstream credentials used by the router. Secret values are never shown.
+          </p>
+          {byProviderKey.length === 0 ? (
+            <div className="text-sm text-muted-foreground text-center py-6">No provider-key usage in this range.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>API label</TableHead>
+                    <TableHead>Provider</TableHead>
+                    <TableHead className="text-right">Requests</TableHead>
+                    <TableHead className="text-right">Success</TableHead>
+                    <TableHead className="text-right">Errors</TableHead>
+                    <TableHead className="text-right">Tokens (in→out)</TableHead>
+                    <TableHead className="text-right">Models</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {byProviderKey.map((k) => (
+                    <TableRow key={`${k.platform}:${k.keyId ?? 'legacy'}`}>
+                      <TableCell className="font-medium">{k.label}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{k.platform}</TableCell>
+                      <TableCell className="text-right tabular-nums">{k.totalRequests.toLocaleString('en-US')}</TableCell>
+                      <TableCell className="text-right tabular-nums text-emerald-600">{k.successCount.toLocaleString('en-US')}</TableCell>
+                      <TableCell className="text-right tabular-nums">{k.errorCount.toLocaleString('en-US')}</TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">{formatTokens(k.inputTokens)} → {formatTokens(k.outputTokens)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{k.modelCount}</TableCell>
+                    </TableRow>
+                  ))}
                 </TableBody>
               </Table>
             </div>

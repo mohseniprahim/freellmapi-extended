@@ -14,7 +14,10 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
-           m.monthly_token_budget
+           m.monthly_token_budget, m.modality, m.vision_capable,
+           m.supports_img2img, m.supports_inpainting, m.supports_json_mode,
+           m.is_reasoning, m.price_input_per_1m, m.price_output_per_1m,
+           m.price_per_call
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     ORDER BY fc.priority ASC
@@ -50,6 +53,18 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rpmLimit: r.rpm_limit,
       rpdLimit: r.rpd_limit,
       monthlyTokenBudget: r.monthly_token_budget,
+      modality: r.modality ?? 'text',
+      visionCapable: r.vision_capable === 1,
+      supportsImg2Img: r.supports_img2img === 1,
+      supportsInpainting: r.supports_inpainting === 1,
+      supportsJsonMode: r.supports_json_mode === 1,
+      isReasoning: r.is_reasoning === 1,
+      isPaid: !String(r.model_id).endsWith(':free') && (
+        Number(r.price_input_per_1m ?? 0) > 0 ||
+        Number(r.price_output_per_1m ?? 0) > 0 ||
+        Number(r.price_per_call ?? 0) > 0 ||
+        r.platform === 'openrouter'
+      ),
       keyCount: keyCountMap.get(r.platform) ?? 0,
     };
   }));

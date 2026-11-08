@@ -412,6 +412,48 @@ analyticsRouter.get('/by-key', (req: Request, res: Response) => {
   })));
 });
 
+/**
+ * Provider-key usage: unlike /by-key (which is about caller/project keys),
+ * this groups the actual upstream API credentials used by the router. Key
+ * values are never returned; only the operator-defined label and platform.
+ */
+analyticsRouter.get('/by-provider-key', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      r.platform,
+      r.key_id,
+      COALESCE(k.label, CASE WHEN r.key_id = 0 THEN 'Keyless provider' ELSE 'Unknown key' END) AS label,
+      COUNT(*) AS total_requests,
+      SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END) AS success_count,
+      SUM(CASE WHEN r.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+      SUM(CASE WHEN r.status = 'success' THEN r.input_tokens ELSE 0 END) AS input_tokens,
+      SUM(CASE WHEN r.status = 'success' THEN r.output_tokens ELSE 0 END) AS output_tokens,
+      COUNT(DISTINCT CASE WHEN r.status = 'success' THEN r.model_id END) AS model_count,
+      MAX(r.created_at) AS last_used
+    FROM requests r
+    LEFT JOIN api_keys k ON k.id = r.key_id
+    WHERE r.created_at >= ?
+    GROUP BY r.platform, r.key_id, k.label
+    ORDER BY total_requests DESC
+  `).all(since) as any[];
+
+  res.json(rows.map(r => ({
+    platform: r.platform,
+    keyId: r.key_id,
+    label: r.label,
+    totalRequests: r.total_requests,
+    successCount: r.success_count ?? 0,
+    errorCount: r.error_count ?? 0,
+    inputTokens: r.input_tokens ?? 0,
+    outputTokens: r.output_tokens ?? 0,
+    modelCount: r.model_count ?? 0,
+    lastUsed: r.last_used,
+  })));
+});
+
 // Reset analytics for a window — deletes the `requests` rows the chosen range
 // displays (default 24h). Behind the dashboard Basic Auth (nginx). Used to
 // clear probe / test noise and start a fresh measurement window.

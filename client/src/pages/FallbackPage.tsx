@@ -39,6 +39,13 @@ interface FallbackEntry {
   rpdLimit: number | null
   monthlyTokenBudget: string
   keyCount: number
+  modality: string
+  visionCapable: boolean
+  supportsImg2Img: boolean
+  supportsInpainting: boolean
+  supportsJsonMode: boolean
+  isReasoning: boolean
+  isPaid: boolean
 }
 
 function formatTokens(n: number): string {
@@ -243,6 +250,18 @@ function SortableModelRow({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-medium text-sm">{entry.displayName}</span>
           <span className="text-xs text-muted-foreground">{entry.platform}</span>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${entry.isPaid
+            ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200'
+            : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'}`}>
+            {entry.isPaid ? 'PAID' : 'FREE'}
+          </span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+            {entry.modality === 'audio_stt' ? 'STT' : entry.modality === 'audio_tts' ? 'TTS' : entry.modality}
+          </span>
+          {entry.visionCapable && <span title="Supports image input" className="text-[10px]">IMG</span>}
+          {entry.supportsImg2Img && <span title="Supports image-to-image" className="text-[10px]">I2I</span>}
+          {entry.supportsInpainting && <span title="Supports inpainting" className="text-[10px]">INPAINT</span>}
+          {entry.modality === 'audio_stt' && <span title="Eligible for audio routing" className="text-[10px]">AUDIO</span>}
           {entry.penalty > 0 && (
             <span className="text-xs text-amber-600 dark:text-amber-400">
               −{entry.penalty} penalty

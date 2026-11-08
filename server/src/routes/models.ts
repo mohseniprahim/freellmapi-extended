@@ -39,6 +39,21 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     tpdLimit: m.tpd_limit,
     monthlyTokenBudget: m.monthly_token_budget,
     contextWindow: m.context_window,
+    modality: m.modality ?? 'text',
+    visionCapable: m.vision_capable === 1,
+    supportsImg2Img: m.supports_img2img === 1,
+    supportsInpainting: m.supports_inpainting === 1,
+    supportsJsonMode: m.supports_json_mode === 1,
+    isReasoning: m.is_reasoning === 1,
+    // The catalog has explicit pricing for paid routes; OpenRouter's :free
+    // suffix is also treated as authoritative when a provider has no price
+    // metadata yet.
+    isPaid: !String(m.model_id).endsWith(':free') && (
+      Number(m.price_input_per_1m ?? 0) > 0 ||
+      Number(m.price_output_per_1m ?? 0) > 0 ||
+      Number(m.price_per_call ?? 0) > 0 ||
+      m.platform === 'openrouter'
+    ),
     enabled: m.enabled === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
