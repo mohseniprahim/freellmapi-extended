@@ -2864,6 +2864,33 @@ function migrateModelsV62FreeAudioChat(db: Database.Database) {
     update.run(row.id);
     addFallback.run(row.id);
   }
+
+  // Apply the requested first-run audio order once. Later manual changes in
+  // the Fallback page must remain authoritative.
+  const alreadyOrdered = db.prepare(
+    "SELECT value FROM settings WHERE key = 'audio_direct_order_v62'"
+  ).get() as { value: string } | undefined;
+  if (!alreadyOrdered) {
+    const preferred = [
+      'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+      'stealth/crouton-alpha',
+      'google/gemini-2.5-flash',
+      'google/gemini-2.5-pro',
+      'openai/gpt-4o-audio-preview',
+    ];
+    const ids = db.prepare(
+      `SELECT id, model_id FROM models WHERE platform = 'openrouter' AND model_id IN (${preferred.map(() => '?').join(',')})`
+    ).all(...preferred) as Array<{ id: number; model_id: string }>;
+    const idByModel = new Map(ids.map(row => [row.model_id, row.id]));
+    const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS value FROM fallback_config').get() as { value: number }).value;
+    db.prepare('UPDATE fallback_config SET priority = priority + ?').run(maxPriority + preferred.length + 1);
+    const setPriority = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
+    for (let i = 0; i < preferred.length; i++) {
+      const id = idByModel.get(preferred[i]);
+      if (id !== undefined) setPriority.run(i + 1, id);
+    }
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('audio_direct_order_v62', '1')").run();
+  }
 }
 
 function migrateModelsV59KiloGemma4(db: Database.Database) {
