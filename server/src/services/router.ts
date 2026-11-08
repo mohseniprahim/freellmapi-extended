@@ -291,6 +291,7 @@ export function routeRequest(
       else if (imageOps?.requireImg2Img) whereParts.push('supports_img2img = 1');
     } else if (modality === 'audio_stt') {
       whereParts.push("modality = 'audio_stt'");
+      whereParts.push('audio_routing_enabled = 1');
     } else if (modality === 'audio_tts') {
       whereParts.push("modality = 'audio_tts'");
     } else if (modality === 'embedding') {

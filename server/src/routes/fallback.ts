@@ -56,7 +56,9 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       monthlyTokenBudget: r.monthly_token_budget,
       modality: r.modality ?? 'text',
       visionCapable: r.vision_capable === 1,
-      audioCapable: r.audio_capable === 1,
+      // STT rows are audio-capable by definition, even if they predate V60
+      // and still have the default audio_capable=0 flag.
+      audioCapable: r.audio_capable === 1 || r.modality === 'audio_stt',
       imageRoutingEnabled: r.image_routing_enabled !== 0,
       audioRoutingEnabled: r.audio_routing_enabled !== 0,
       supportsImg2Img: r.supports_img2img === 1,
