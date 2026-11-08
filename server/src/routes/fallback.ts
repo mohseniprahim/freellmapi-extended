@@ -76,6 +76,85 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
   }));
 });
 
+const modalityPlanSchema = z.object({
+  plan: z.enum(['text', 'audio', 'vision']),
+  entries: z.array(z.object({
+    modelDbId: z.number(),
+    priority: z.number(),
+    enabled: z.boolean(),
+  })),
+});
+
+fallbackRouter.get('/plans', (_req: Request, res: Response) => {
+  const db = getDb();
+  const keyCounts = db.prepare('SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 GROUP BY platform').all() as { platform: string; count: number }[];
+  const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
+  const penalties = new Map(getAllPenalties().map(p => [p.modelDbId, p]));
+  const rows = db.prepare(`
+    SELECT frc.modality, frc.model_db_id, frc.priority, frc.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank, m.speed_rank,
+           m.size_label, m.rpm_limit, m.rpd_limit, m.monthly_token_budget, m.modality AS model_modality,
+           m.vision_capable, m.audio_capable, m.supports_img2img, m.supports_inpainting,
+           m.supports_json_mode, m.is_reasoning, m.image_routing_enabled, m.audio_routing_enabled,
+           m.price_input_per_1m, m.price_output_per_1m, m.price_per_call
+      FROM fallback_modality_config frc
+      JOIN models m ON m.id = frc.model_db_id
+     ORDER BY frc.modality ASC, frc.priority ASC
+  `).all() as any[];
+  const result: Record<string, unknown[]> = { text: [], audio: [], vision: [] };
+  for (const r of rows) {
+    const penalty = penalties.get(r.model_db_id);
+    (result[r.modality] ??= []).push({
+      modelDbId: r.model_db_id,
+      priority: r.priority,
+      effectivePriority: r.priority + (penalty?.penalty ?? 0),
+      penalty: penalty?.penalty ?? 0,
+      rateLimitHits: penalty?.count ?? 0,
+      enabled: r.enabled === 1,
+      platform: r.platform,
+      modelId: r.model_id,
+      displayName: r.display_name,
+      intelligenceRank: r.intelligence_rank,
+      speedRank: r.speed_rank,
+      sizeLabel: r.size_label,
+      rpmLimit: r.rpm_limit,
+      rpdLimit: r.rpd_limit,
+      monthlyTokenBudget: r.monthly_token_budget,
+      keyCount: keyCountMap.get(r.platform) ?? 0,
+      modality: r.model_modality ?? 'text',
+      visionCapable: r.vision_capable === 1,
+      audioCapable: r.audio_capable === 1 || r.model_modality === 'audio_stt',
+      imageRoutingEnabled: r.image_routing_enabled !== 0,
+      audioRoutingEnabled: r.audio_routing_enabled !== 0,
+      supportsImg2Img: r.supports_img2img === 1,
+      supportsInpainting: r.supports_inpainting === 1,
+      supportsJsonMode: r.supports_json_mode === 1,
+      isReasoning: r.is_reasoning === 1,
+      isPaid: !String(r.model_id).endsWith(':free') && (Number(r.price_input_per_1m ?? 0) > 0 || Number(r.price_output_per_1m ?? 0) > 0 || Number(r.price_per_call ?? 0) > 0 || r.platform === 'openrouter'),
+    });
+  }
+  res.json(result);
+});
+
+fallbackRouter.put('/plans', (req: Request, res: Response) => {
+  const parsed = modalityPlanSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+  const db = getDb();
+  const update = db.prepare('UPDATE fallback_modality_config SET priority = ?, enabled = ? WHERE modality = ? AND model_db_id = ?');
+  const updateLegacy = db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?');
+  const save = db.transaction(() => {
+    for (const entry of parsed.data.entries) {
+      update.run(entry.priority, entry.enabled ? 1 : 0, parsed.data.plan, entry.modelDbId);
+      if (parsed.data.plan === 'text') updateLegacy.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
+    }
+  });
+  save();
+  res.json({ success: true, plan: parsed.data.plan });
+});
+
 const updateSchema = z.array(z.object({
   modelDbId: z.number(),
   priority: z.number(),

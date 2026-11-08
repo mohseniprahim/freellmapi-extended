@@ -117,6 +117,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV62FreeAudioChat(db);
   migrateRequestsV63InputKind(db);
   migrateRequestsV64PreviewFields(db);
+  migrateModalityFallbackRoutes(db);
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
@@ -128,6 +129,19 @@ export function initDb(dbPath?: string): Database.Database {
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
+}
+
+function migrateModalityFallbackRoutes(db: Database.Database) {
+  const count = (db.prepare('SELECT COUNT(*) AS cnt FROM fallback_modality_config').get() as { cnt: number }).cnt;
+  if (count > 0) return;
+  const rows = db.prepare('SELECT model_db_id, priority, enabled FROM fallback_config ORDER BY priority ASC').all() as Array<{ model_db_id: number; priority: number; enabled: number }>;
+  const insert = db.prepare('INSERT OR IGNORE INTO fallback_modality_config (modality, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)');
+  const seed = db.transaction(() => {
+    for (const modality of ['text', 'audio', 'vision']) {
+      for (const row of rows) insert.run(modality, row.model_db_id, row.priority, row.enabled);
+    }
+  });
+  seed();
 }
 
 function createTables(db: Database.Database) {
@@ -181,6 +195,14 @@ function createTables(db: Database.Database) {
       priority INTEGER NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1,
       UNIQUE(model_db_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS fallback_modality_config (
+      modality TEXT NOT NULL CHECK (modality IN ('text', 'audio', 'vision')),
+      model_db_id INTEGER NOT NULL REFERENCES models(id),
+      priority INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (modality, model_db_id)
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -487,6 +509,11 @@ function migrateModelsV4(db: Database.Database) {
       SELECT id FROM models WHERE platform = ? AND model_id = ?
     )
   `);
+  const deleteModalityFallback = db.prepare(`
+    DELETE FROM fallback_modality_config WHERE model_db_id IN (
+      SELECT id FROM models WHERE platform = ? AND model_id = ?
+    )
+  `);
   const removals: Array<[string, string]> = [
     ['moonshot', 'kimi-latest'],                                            // paid-only now ($1 min deposit)
     ['minimax', 'MiniMax-M1'],                                              // superseded; use OR minimax-m2.5:free
@@ -496,6 +523,7 @@ function migrateModelsV4(db: Database.Database) {
   const applyRemovals = db.transaction(() => {
     for (const [p, m] of removals) {
       deleteFallback.run(p, m);
+      deleteModalityFallback.run(p, m);
       deleteModel.run(p, m);
     }
   });

@@ -199,12 +199,22 @@ export function routeRequest(
 ): RouteResult {
   const db = getDb();
 
-  // Get fallback chain ordered by priority
-  const fallbackChain = db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled
-    FROM fallback_config fc
-    ORDER BY fc.priority ASC
-  `).all() as FallbackRow[];
+  // Each modality has its own independent plan. The same model may therefore
+  // appear in Text, Audio, and Vision with different priorities or enabled
+  // states, exactly as an operator configures it in the admin UI.
+  const routePlan = requireVision ? 'vision' : (requireAudio || modality === 'audio_stt' ? 'audio' : 'text');
+  const fallbackChain = routePlan === 'text'
+    ? db.prepare(`
+        SELECT fc.model_db_id, fc.priority, fc.enabled
+        FROM fallback_config fc
+        ORDER BY fc.priority ASC
+      `).all() as FallbackRow[]
+    : db.prepare(`
+        SELECT fmc.model_db_id, fmc.priority, fmc.enabled
+        FROM fallback_modality_config fmc
+        WHERE fmc.modality = ?
+        ORDER BY fmc.priority ASC
+      `).all(routePlan) as FallbackRow[];
 
   // Apply dynamic penalties: sort by (base priority + penalty)
   let sortedChain: Array<{ model_db_id: number; priority: number; enabled: number }> =

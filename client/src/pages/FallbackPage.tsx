@@ -51,6 +51,15 @@ interface FallbackEntry {
   isPaid: boolean
 }
 
+type PlanName = 'text' | 'audio' | 'vision'
+type FallbackPlans = Record<PlanName, FallbackEntry[]>
+
+const PLAN_LABELS: Record<PlanName, { title: string; description: string }> = {
+  text: { title: 'Text', description: 'رسائل النص العادية' },
+  audio: { title: 'Audio', description: 'التسجيلات الصوتية فقط' },
+  vision: { title: 'Image / Vision', description: 'الصور والمرفقات المرئية' },
+}
+
 function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -216,13 +225,11 @@ function SortableModelRow({
   entry,
   index,
   onToggle,
-  onMediaToggle,
   onMove,
 }: {
   entry: FallbackEntry
   index: number
   onToggle: (modelDbId: number, enabled: boolean) => void
-  onMediaToggle: (modelDbId: number, kind: 'image' | 'audio', enabled: boolean) => void
   onMove: (modelDbId: number, direction: 'up' | 'down') => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -289,14 +296,6 @@ function SortableModelRow({
           </span>
         </div>
       </div>
-      <div className="hidden md:flex items-center gap-2 text-[10px] text-muted-foreground">
-        {entry.visionCapable && <label className="flex items-center gap-1" title="Allow this model to receive image messages">
-          <span>Images</span><Switch className="scale-75" checked={entry.imageRoutingEnabled} onCheckedChange={(v) => onMediaToggle(entry.modelDbId, 'image', v)} />
-        </label>}
-        {entry.audioCapable && <label className="flex items-center gap-1" title="Allow this model to receive audio messages">
-          <span>Audio</span><Switch className="scale-75" checked={entry.audioRoutingEnabled} onCheckedChange={(v) => onMediaToggle(entry.modelDbId, 'audio', v)} />
-        </label>}
-      </div>
       <div className="flex items-center gap-1" aria-label="Change model priority">
         <button type="button" className="rounded border px-1.5 py-0.5 text-xs hover:bg-muted" title="Move up" onClick={() => onMove(entry.modelDbId, 'up')}>↑</button>
         <button type="button" className="rounded border px-1.5 py-0.5 text-xs hover:bg-muted" title="Move down" onClick={() => onMove(entry.modelDbId, 'down')}>↓</button>
@@ -311,11 +310,12 @@ function SortableModelRow({
 
 export default function FallbackPage() {
   const queryClient = useQueryClient()
-  const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
+  const [activePlan, setActivePlan] = useState<PlanName>('text')
+  const [localPlans, setLocalPlans] = useState<Partial<FallbackPlans> | null>(null)
 
-  const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({
-    queryKey: ['fallback'],
-    queryFn: () => apiFetch('/api/fallback'),
+  const { data: plans, isLoading } = useQuery<FallbackPlans>({
+    queryKey: ['fallback', 'plans'],
+    queryFn: () => apiFetch('/api/fallback/plans'),
   })
 
   const { data: tokenUsage } = useQuery<TokenUsageData>({
@@ -324,32 +324,23 @@ export default function FallbackPage() {
   })
 
   const saveMutation = useMutation({
-    mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean; imageRoutingEnabled: boolean; audioRoutingEnabled: boolean }[]) =>
-      apiFetch('/api/fallback', { method: 'PUT', body: JSON.stringify(data) }),
+    mutationFn: (data: { plan: PlanName; entries: { modelDbId: number; priority: number; enabled: boolean }[] }) =>
+      apiFetch('/api/fallback/plans', { method: 'PUT', body: JSON.stringify(data) }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      setLocalEntries(null)
-    },
-  })
-
-  const sortMutation = useMutation({
-    mutationFn: (preset: string) =>
-      apiFetch(`/api/fallback/sort/${preset}`, { method: 'POST' }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      setLocalEntries(null)
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'plans'] })
+      setLocalPlans(null)
     },
   })
 
   const syncOpenRouterMutation = useMutation({
     mutationFn: () => apiFetch('/api/models/sync-openrouter', { method: 'POST' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'plans'] })
       queryClient.invalidateQueries({ queryKey: ['models'] })
     },
   })
 
-  const allEntries = localEntries ?? entries
+  const allEntries = localPlans?.[activePlan] ?? plans?.[activePlan] ?? []
   // Never hide catalog rows just because a provider key is missing. Paid
   // OpenRouter models must remain visible so the operator can configure them.
   const displayEntries = allEntries
@@ -369,20 +360,14 @@ export default function FallbackPage() {
     // displayEntries currently contains the complete catalog, including rows
     // without configured keys. Appending those rows again creates duplicate
     // sortable IDs and makes both mouse and touch drag operations fail.
-    setLocalEntries(reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })))
+    setLocalPlans({ ...(localPlans ?? {}), [activePlan]: reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })) })
   }
 
   function handleToggle(modelDbId: number, enabled: boolean) {
     const updated = allEntries.map(e =>
       e.modelDbId === modelDbId ? { ...e, enabled } : e
     )
-    setLocalEntries(updated)
-  }
-
-  function handleMediaToggle(modelDbId: number, kind: 'image' | 'audio', enabled: boolean) {
-    setLocalEntries(allEntries.map(e => e.modelDbId === modelDbId
-      ? (kind === 'image' ? { ...e, imageRoutingEnabled: enabled } : { ...e, audioRoutingEnabled: enabled })
-      : e))
+    setLocalPlans({ ...(localPlans ?? {}), [activePlan]: updated })
   }
 
   function handleMove(modelDbId: number, direction: 'up' | 'down') {
@@ -390,23 +375,21 @@ export default function FallbackPage() {
     const nextIndex = direction === 'up' ? index - 1 : index + 1
     if (index < 0 || nextIndex < 0 || nextIndex >= allEntries.length) return
     const reordered = arrayMove(allEntries, index, nextIndex)
-    setLocalEntries(reordered.map((entry, i) => ({ ...entry, priority: i + 1 })))
+    setLocalPlans({ ...(localPlans ?? {}), [activePlan]: reordered.map((entry, i) => ({ ...entry, priority: i + 1 })) })
   }
 
   function handleSave() {
-    if (!localEntries) return
+    if (!localPlans?.[activePlan]) return
     saveMutation.mutate(
-      allEntries.map(e => ({
+      { plan: activePlan, entries: allEntries.map(e => ({
         modelDbId: e.modelDbId,
         priority: e.priority,
         enabled: e.enabled,
-        imageRoutingEnabled: e.imageRoutingEnabled,
-        audioRoutingEnabled: e.audioRoutingEnabled,
-      }))
+      })) }
     )
   }
 
-  const hasChanges = localEntries !== null
+  const hasChanges = Boolean(localPlans?.[activePlan])
 
   return (
     <div>
@@ -418,23 +401,27 @@ export default function FallbackPage() {
             <Button variant="outline" size="sm" onClick={() => syncOpenRouterMutation.mutate()} disabled={syncOpenRouterMutation.isPending}>
               {syncOpenRouterMutation.isPending ? 'Syncing OpenRouter…' : 'Sync OpenRouter models'}
             </Button>
-            <Button variant="default" size="sm" onClick={() => sortMutation.mutate('quality')} disabled={sortMutation.isPending}>
-              Sort by quality
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('intelligence')} disabled={sortMutation.isPending}>
-              Sort by intelligence
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('speed')} disabled={sortMutation.isPending}>
-              Sort by speed
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('budget')} disabled={sortMutation.isPending}>
-              Sort by budget
-            </Button>
           </>
         }
       />
 
       <div className="space-y-6">
+        <div className="rounded-lg border bg-card p-2 flex flex-wrap gap-2">
+          {(Object.keys(PLAN_LABELS) as PlanName[]).map((plan) => (
+            <button
+              key={plan}
+              type="button"
+              onClick={() => setActivePlan(plan)}
+              className={`rounded-md px-4 py-2 text-left transition-colors ${activePlan === plan ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
+            >
+              <span className="block text-sm font-medium">{PLAN_LABELS[plan].title}</span>
+              <span className={`block text-xs ${activePlan === plan ? 'text-primary-foreground/80' : 'text-muted-foreground'}`}>{PLAN_LABELS[plan].description}</span>
+            </button>
+          ))}
+        </div>
+        <div className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
+          ترتيب وتفعيل خطة <strong className="text-foreground">{PLAN_LABELS[activePlan].title}</strong> مستقل عن الخطط الأخرى. يمكن استخدام النموذج نفسه في أكثر من خطة.
+        </div>
         {/* TEXT modality — monthly + daily token budgets */}
         {tokenUsage && tokenUsage.totalBudget > 0 && (
           <TokenUsageBar
@@ -636,7 +623,6 @@ export default function FallbackPage() {
                       entry={entry}
                       index={index}
                       onToggle={handleToggle}
-                      onMediaToggle={handleMediaToggle}
                       onMove={handleMove}
                     />
                   ))}
@@ -646,7 +632,7 @@ export default function FallbackPage() {
 
             {hasChanges && (
               <div className="flex justify-end gap-2">
-                <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>
+                <Button variant="outline" size="sm" onClick={() => setLocalPlans(null)}>
                   Discard
                 </Button>
                 <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
