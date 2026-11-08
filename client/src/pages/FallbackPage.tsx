@@ -217,11 +217,13 @@ function SortableModelRow({
   index,
   onToggle,
   onMediaToggle,
+  onMove,
 }: {
   entry: FallbackEntry
   index: number
   onToggle: (modelDbId: number, enabled: boolean) => void
   onMediaToggle: (modelDbId: number, kind: 'image' | 'audio', enabled: boolean) => void
+  onMove: (modelDbId: number, direction: 'up' | 'down') => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: entry.modelDbId,
@@ -295,6 +297,10 @@ function SortableModelRow({
           <span>Audio</span><Switch className="scale-75" checked={entry.audioRoutingEnabled} onCheckedChange={(v) => onMediaToggle(entry.modelDbId, 'audio', v)} />
         </label>}
       </div>
+      <div className="flex items-center gap-1" aria-label="Change model priority">
+        <button type="button" className="rounded border px-1.5 py-0.5 text-xs hover:bg-muted" title="Move up" onClick={() => onMove(entry.modelDbId, 'up')}>↑</button>
+        <button type="button" className="rounded border px-1.5 py-0.5 text-xs hover:bg-muted" title="Move down" onClick={() => onMove(entry.modelDbId, 'down')}>↓</button>
+      </div>
       <Switch
         checked={entry.enabled}
         onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)}
@@ -360,12 +366,10 @@ export default function FallbackPage() {
     const oldIndex = displayEntries.findIndex(e => e.modelDbId === active.id)
     const newIndex = displayEntries.findIndex(e => e.modelDbId === over.id)
     const reorderedVisible = arrayMove(displayEntries, oldIndex, newIndex)
-    const unconfigured = allEntries.filter(e => e.keyCount === 0)
-    const merged = [
-      ...reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })),
-      ...unconfigured.map((e, i) => ({ ...e, priority: reorderedVisible.length + i + 1 })),
-    ]
-    setLocalEntries(merged)
+    // displayEntries currently contains the complete catalog, including rows
+    // without configured keys. Appending those rows again creates duplicate
+    // sortable IDs and makes both mouse and touch drag operations fail.
+    setLocalEntries(reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })))
   }
 
   function handleToggle(modelDbId: number, enabled: boolean) {
@@ -379,6 +383,14 @@ export default function FallbackPage() {
     setLocalEntries(allEntries.map(e => e.modelDbId === modelDbId
       ? (kind === 'image' ? { ...e, imageRoutingEnabled: enabled } : { ...e, audioRoutingEnabled: enabled })
       : e))
+  }
+
+  function handleMove(modelDbId: number, direction: 'up' | 'down') {
+    const index = allEntries.findIndex(e => e.modelDbId === modelDbId)
+    const nextIndex = direction === 'up' ? index - 1 : index + 1
+    if (index < 0 || nextIndex < 0 || nextIndex >= allEntries.length) return
+    const reordered = arrayMove(allEntries, index, nextIndex)
+    setLocalEntries(reordered.map((entry, i) => ({ ...entry, priority: i + 1 })))
   }
 
   function handleSave() {
@@ -625,6 +637,7 @@ export default function FallbackPage() {
                       index={index}
                       onToggle={handleToggle}
                       onMediaToggle={handleMediaToggle}
+                      onMove={handleMove}
                     />
                   ))}
                 </SortableContext>
