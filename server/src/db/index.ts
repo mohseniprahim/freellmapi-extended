@@ -115,6 +115,8 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV60MediaRouting(db);
   migrateModelsV61AudioChat(db);
   migrateModelsV62FreeAudioChat(db);
+  migrateRequestsV63InputKind(db);
+  migrateRequestsV64PreviewFields(db);
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
@@ -2890,6 +2892,20 @@ function migrateModelsV62FreeAudioChat(db: Database.Database) {
       if (id !== undefined) setPriority.run(i + 1, id);
     }
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('audio_direct_order_v62', '1')").run();
+  }
+}
+
+/** V63 — distinguish text, image, and audio chat turns in the usage report. */
+function migrateRequestsV63InputKind(db: Database.Database) {
+  try { db.exec("ALTER TABLE requests ADD COLUMN input_kind TEXT NOT NULL DEFAULT 'text'"); }
+  catch (e: any) { if (!(e?.message ?? '').includes('duplicate column')) throw e; }
+}
+
+/** V64 — short text previews for the chronological usage report; never files/base64. */
+function migrateRequestsV64PreviewFields(db: Database.Database) {
+  for (const [name, type] of [['input_preview', 'TEXT'], ['response_preview', 'TEXT']] as const) {
+    try { db.exec(`ALTER TABLE requests ADD COLUMN ${name} ${type}`); }
+    catch (e: any) { if (!(e?.message ?? '').includes('duplicate column')) throw e; }
   }
 }
 

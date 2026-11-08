@@ -254,6 +254,41 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
   })));
 });
 
+// Chronological, successful model responses. Binary attachments are never
+// copied here: the row stores only the media kind and a short text preview.
+analyticsRouter.get('/usage-log', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT r.id, r.created_at, r.platform, r.model_id, r.status,
+           COALESCE(r.input_kind,
+             CASE WHEN r.has_image = 1 THEN 'image' ELSE 'text' END) AS input_kind,
+           r.input_preview, r.response_preview, r.input_tokens, r.output_tokens,
+           r.latency_ms, r.request_id, m.display_name
+      FROM requests r
+      LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
+     WHERE r.created_at >= ? AND r.status = 'success'
+     ORDER BY r.created_at DESC, r.id DESC
+     LIMIT 200
+  `).all(since) as any[];
+  res.json(rows.map(r => ({
+    id: r.id,
+    createdAt: r.created_at,
+    platform: r.platform,
+    modelId: r.model_id,
+    displayName: r.display_name ?? r.model_id,
+    status: r.status,
+    inputKind: r.input_kind ?? 'text',
+    inputPreview: r.input_preview ?? null,
+    responsePreview: r.response_preview ?? null,
+    inputTokens: r.input_tokens ?? 0,
+    outputTokens: r.output_tokens ?? 0,
+    latencyMs: r.latency_ms ?? 0,
+    requestId: r.request_id ?? null,
+  })));
+});
+
 // Error distribution (grouped by error type and platform)
 analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';

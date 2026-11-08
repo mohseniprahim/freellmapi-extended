@@ -355,6 +355,44 @@ export function isAudioInput(messages: ChatMessage[]): boolean {
   return messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'input_audio'));
 }
 
+function previewText(value: unknown, limit = 500): string | null {
+  if (typeof value !== 'string') return null;
+  const clean = value.replace(/\s+/g, ' ').trim();
+  return clean ? clean.slice(0, limit) : null;
+}
+
+/** Human-readable metadata only: never persist image/audio bytes or data URLs. */
+export function inputPreview(messages: ChatMessage[]): string | null {
+  const parts: string[] = [];
+  for (const message of messages) {
+    if (message.role !== 'user') continue;
+    if (typeof message.content === 'string') {
+      const text = previewText(message.content);
+      if (text) parts.push(text);
+      continue;
+    }
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === 'text') {
+        const text = previewText(part.text);
+        if (text) parts.push(text);
+      } else if (part.type === 'image_url') {
+        parts.push('[صورة مرفقة]');
+      } else if (part.type === 'input_audio') {
+        parts.push('[تسجيل صوتي مرفق]');
+      }
+    }
+  }
+  return previewText(parts.join(' '));
+}
+
+function responsePreview(response: unknown): string | null {
+  const content = (response as { choices?: Array<{ message?: { content?: unknown } }> })
+    ?.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return previewText(content);
+  return null;
+}
+
 export function countImageParts(messages: ChatMessage[]): number {
   let n = 0;
   for (const m of messages) {
@@ -566,6 +604,9 @@ export interface LogRequestOpts {
   endUserId?: string | null;
   // Computed cost in micro-USD (V54). When omitted, computed from pricing lib.
   costMicro?: number;
+  inputKind?: 'text' | 'image' | 'audio';
+  inputPreview?: string | null;
+  responsePreview?: string | null;
 }
 
 export function logRequest(opts: LogRequestOpts) {
@@ -586,9 +627,10 @@ export function logRequest(opts: LogRequestOpts) {
       INSERT INTO requests (
         platform, model_id, status, input_tokens, output_tokens, latency_ms,
         error, error_class, upstream_status, attempts, has_image, response_format,
-        key_id, request_id, modality, client_key_id, end_user_id, cost_micro
+        key_id, request_id, modality, client_key_id, end_user_id, cost_micro,
+        input_kind, input_preview, response_preview
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       opts.platform,
       opts.modelId,
@@ -608,6 +650,9 @@ export function logRequest(opts: LogRequestOpts) {
       opts.clientKeyId ?? clientCtx.getStore()?.clientKeyId ?? null,
       endUserId,
       costMicro,
+      opts.inputKind ?? 'text',
+      opts.inputPreview ?? null,
+      opts.responsePreview ?? null,
     );
   } catch (e) {
     console.error('Failed to log request:', e);
@@ -627,6 +672,8 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
   const requireVision = isMultimodal(messages);
   const requireAudio = isAudioInput(messages);
+  const inputKind: LogRequestOpts['inputKind'] = requireAudio ? 'audio' : requireVision ? 'image' : 'text';
+  const inputSummary = inputPreview(messages);
   const requireJsonMode = requiresJsonMode(response_format);
   const responseFormatType = response_format?.type ?? null;
   // Per-request id (lightweight; collisions in DB index OK). Lets us join
@@ -706,6 +753,9 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
         responseFormat: responseFormatType,
         keyId: route.keyId,
         requestId: reqId,
+        inputKind,
+        inputPreview: inputSummary,
+        responsePreview: responsePreview(result),
       });
 
       return {
@@ -734,6 +784,8 @@ export async function runChatCompletion(parsed: ChatCompletionRequest): Promise<
         responseFormat: responseFormatType,
         keyId: route.keyId,
         requestId: reqId,
+        inputKind,
+        inputPreview: inputSummary,
       });
 
       if (isRetryableError(err)) {

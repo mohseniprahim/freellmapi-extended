@@ -87,6 +87,21 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<any[]>(`/api/analytics/timeline?range=${range}`),
   })
 
+  const { data: usageLog = [] } = useQuery<Array<{
+    id: number
+    createdAt: string
+    platform: string
+    modelId: string
+    displayName: string
+    inputKind: 'text' | 'image' | 'audio'
+    inputPreview: string | null
+    responsePreview: string | null
+    latencyMs: number
+  }>>({
+    queryKey: ['analytics', 'usage-log', range],
+    queryFn: () => apiFetch(`/api/analytics/usage-log?range=${range}`),
+  })
+
   const { data: byModel = [] } = useQuery({
     queryKey: ['analytics', 'by-model', range],
     queryFn: () => apiFetch<any[]>(`/api/analytics/by-model?range=${range}`),
@@ -247,6 +262,60 @@ export default function AnalyticsPage() {
                     <Line type="monotone" dataKey="failureCount" name="Failures" stroke="var(--destructive)" strokeWidth={1.5} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
+              )}
+            </Panel>
+          </div>
+
+          <div className="lg:col-span-2">
+            <Panel title="Actual response log">
+              <p className="text-xs text-muted-foreground mb-3">
+                كل صف يوضح النموذج الذي رد فعليًا، نوع الطلب، وما تم الرد عليه. لا يتم نسخ ملفات الصوت أو الصور إلى قاعدة البيانات.
+              </p>
+              {usageLog.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-8">No responses yet</p>
+              ) : (
+                <div className="max-h-[520px] overflow-y-auto -mx-4">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="pl-4">Date / time</TableHead>
+                        <TableHead>Input</TableHead>
+                        <TableHead>Model</TableHead>
+                        <TableHead>Replied to</TableHead>
+                        <TableHead>Response</TableHead>
+                        <TableHead className="text-right pr-4">Latency</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {usageLog.map((row) => {
+                        const kindLabel = row.inputKind === 'audio' ? 'صوت' : row.inputKind === 'image' ? 'صورة' : 'نص'
+                        const kindClass = row.inputKind === 'audio'
+                          ? 'bg-teal-100 text-teal-900 dark:bg-teal-950 dark:text-teal-200'
+                          : row.inputKind === 'image'
+                            ? 'bg-purple-100 text-purple-900 dark:bg-purple-950 dark:text-purple-200'
+                            : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200'
+                        return (
+                          <TableRow key={row.id}>
+                            <TableCell className="pl-4 text-xs whitespace-nowrap">
+                              {new Date(row.createdAt).toLocaleString()}
+                            </TableCell>
+                            <TableCell>
+                              <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${kindClass}`}>{kindLabel}</span>
+                            </TableCell>
+                            <TableCell className="text-xs font-medium min-w-[150px]">{row.displayName}</TableCell>
+                            <TableCell className="text-xs text-muted-foreground max-w-[220px]">
+                              <span className="line-clamp-2">{row.inputPreview ?? 'مرفق بدون نص محفوظ'}</span>
+                            </TableCell>
+                            <TableCell className="text-xs max-w-[280px]">
+                              <span className="line-clamp-2">{row.responsePreview ?? '—'}</span>
+                            </TableCell>
+                            <TableCell className="text-right text-xs tabular-nums pr-4 whitespace-nowrap">{row.latencyMs} ms</TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
               )}
             </Panel>
           </div>
