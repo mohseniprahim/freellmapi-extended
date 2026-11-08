@@ -2831,19 +2831,34 @@ function migrateModelsV62FreeAudioChat(db: Database.Database) {
   insert.run('stealth/crouton-alpha', 'Crouton Alpha (free · audio)',
     2, 5, 'Multimodal', '~free', 131072);
 
+  // Gemini 1.5 is no longer present in the live OpenRouter catalog. These
+  // current Gemini audio-capable routes replace it and remain below the free
+  // audio models, but above the paid GPT-4o Audio fallback.
+  const insertGemini = db.prepare(`
+    INSERT OR IGNORE INTO models (
+      platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+      monthly_token_budget, context_window, enabled, modality, supports_json_mode,
+      is_reasoning, audio_capable, audio_routing_enabled, price_input_per_1m,
+      price_output_per_1m
+    ) VALUES ('openrouter', ?, ?, ?, ?, ?, ?, ?, 1, 'text', 0, 0, 1, 1, ?, ?)
+  `);
+  insertGemini.run('google/gemini-2.5-flash', 'Gemini 2.5 Flash (audio)',
+    5, 3, 'Large', '~paid · Google', 1048576, 0.30, 2.50);
+  insertGemini.run('google/gemini-2.5-pro', 'Gemini 2.5 Pro (audio)',
+    4, 4, 'Frontier', '~paid · Google', 1048576, 1.25, 10.00);
+
   const rows = db.prepare(`
     SELECT id FROM models WHERE platform = 'openrouter'
-      AND model_id IN (?, ?)
+      AND model_id IN (?, ?, ?, ?)
   `).all('nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
-    'stealth/crouton-alpha') as Array<{ id: number }>;
+    'stealth/crouton-alpha', 'google/gemini-2.5-flash', 'google/gemini-2.5-pro') as Array<{ id: number }>;
   const addFallback = db.prepare(`
     INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled)
     VALUES (?, (SELECT COALESCE(MAX(priority), 0) + 1 FROM fallback_config), 1)
   `);
   const update = db.prepare(`
     UPDATE models SET modality = 'text', audio_capable = 1,
-      audio_routing_enabled = 1, price_input_per_1m = 0,
-      price_output_per_1m = 0, enabled = 1 WHERE id = ?
+      audio_routing_enabled = 1, enabled = 1 WHERE id = ?
   `);
   for (const row of rows) {
     update.run(row.id);
