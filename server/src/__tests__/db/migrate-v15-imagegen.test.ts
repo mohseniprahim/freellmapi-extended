@@ -57,4 +57,21 @@ describe('migrateModelsV15ImageGen', () => {
     `).all() as Array<{ model_id: string }>;
     expect(orphans.length).toBe(0);
   });
+
+  it('seeds Qwen Image 2.1 Turbo as the first image fallback on OpenRouter', () => {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.platform, m.model_id, m.modality, f.priority,
+        (SELECT MIN(f2.priority) FROM fallback_config f2
+         JOIN models m2 ON m2.id = f2.model_db_id WHERE m2.modality = 'image_gen') AS first_image_priority
+      FROM models m JOIN fallback_config f ON f.model_db_id = m.id
+      WHERE m.platform = 'openrouter' AND m.model_id = 'qwen/qwen-image-2.1-turbo'
+    `).get() as { platform: string; model_id: string; modality: string; priority: number; first_image_priority: number };
+    expect(row).toMatchObject({
+      platform: 'openrouter',
+      model_id: 'qwen/qwen-image-2.1-turbo',
+      modality: 'image_gen',
+    });
+    expect(row.priority).toBe(row.first_image_priority);
+  });
 });

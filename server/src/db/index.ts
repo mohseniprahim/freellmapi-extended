@@ -121,6 +121,7 @@ export function initDb(dbPath?: string): Database.Database {
   // Must run LAST: re-sorts the fallback chain with the V57 balanced score,
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
+  migrateModelsV65OpenRouterImage(db);
 
   // Older deployments regenerated settings.unified_api_key without updating
   // client_keys. Backfill the current value once per missing hash so existing
@@ -142,6 +143,33 @@ function migrateModalityFallbackRoutes(db: Database.Database) {
     }
   });
   seed();
+}
+
+/** V65: route one low-cost OpenRouter image model through the dedicated Images API. */
+function migrateModelsV65OpenRouterImage(db: Database.Database) {
+  db.prepare(`
+    INSERT OR IGNORE INTO models (
+      platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+      rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+      enabled, modality, neurons_per_call
+    ) VALUES ('openrouter', 'qwen/qwen-image-2.1-turbo', 'Qwen Image 2.1 Turbo (OpenRouter)',
+      1, 1, 'Image', 20, NULL, NULL, NULL, 'paid-per-image', NULL, 1, 'image_gen', NULL)
+  `).run();
+
+  const model = db.prepare(`
+    SELECT id FROM models WHERE platform = 'openrouter' AND model_id = 'qwen/qwen-image-2.1-turbo'
+  `).get() as { id: number } | undefined;
+  if (!model) return;
+
+  const existing = db.prepare('SELECT id FROM fallback_config WHERE model_db_id = ?').get(model.id);
+  if (!existing) {
+    const firstImage = db.prepare(`
+      SELECT MIN(f.priority) AS priority FROM fallback_config f
+      JOIN models m ON m.id = f.model_db_id WHERE m.modality = 'image_gen'
+    `).get() as { priority: number | null };
+    db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)')
+      .run(model.id, (firstImage.priority ?? 1) - 1);
+  }
 }
 
 function createTables(db: Database.Database) {

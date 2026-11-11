@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@myllm/shared/types.js';
-import { BaseProvider, type CompletionOptions, type EmbedOptions, type EmbedResult } from './base.js';
+import { BaseProvider, type CompletionOptions, type EmbedOptions, type EmbedResult, type ImageGenerationOptions, type ImageGenerationResult } from './base.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -249,6 +249,62 @@ export class OpenAICompatProvider extends BaseProvider {
 
     return { vectors, promptTokens, dimensions };
   }
+
+  /** OpenRouter's dedicated image API is not the OpenAI /images/generations shape.
+   * Keep this override scoped to OpenRouter so other compatible chat providers
+   * continue to reject image generation unless explicitly implemented. */
+  async generateImage(
+    apiKey: string,
+    modelId: string,
+    prompt: string,
+    options?: ImageGenerationOptions,
+  ): Promise<ImageGenerationResult> {
+    if (this.platform !== 'openrouter') return super.generateImage(apiKey, modelId, prompt, options);
+
+    const [width, height] = (options?.size ?? '1024x1024').split('x').map(Number);
+    const aspectRatio = width > 0 && height > 0 ? `${width / gcd(width, height)}:${height / gcd(width, height)}` : '1:1';
+    const payload = {
+      model: modelId,
+      prompt: options?.negative_prompt ? `${prompt}\n\nAvoid: ${options.negative_prompt}` : prompt,
+      resolution: Math.max(width, height) > 1024 ? '2K' : '1K',
+      aspect_ratio: aspectRatio,
+      n: options?.n ?? 1,
+    };
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/images`, {
+      method: 'POST',
+      headers: {
+        ...this.authHeaders(apiKey),
+        'Content-Type': 'application/json',
+        ...this.extraHeaders,
+      },
+      body: JSON.stringify(payload),
+    }, 120_000);
+
+    if (!response.ok) {
+      let message = response.statusText;
+      try {
+        const error = await response.json() as any;
+        message = error.error?.message ?? error.message ?? message;
+      } catch {}
+      throw new Error(`${this.name} image API error ${response.status}: ${message}`);
+    }
+
+    const data = await response.json() as {
+      data?: Array<{ b64_json?: string; media_type?: string }>;
+    };
+    const images = (data.data ?? []).filter((item): item is { b64_json: string; media_type?: string } => Boolean(item.b64_json));
+    if (images.length === 0) throw new Error(`${this.name} image API returned no base64 image data for ${modelId}`);
+    const mimeType = images[0].media_type === 'image/jpeg' ? 'image/jpeg'
+      : images[0].media_type === 'image/webp' ? 'image/webp' : 'image/png';
+    return { b64Images: images.map(image => image.b64_json), mimeType };
+  }
+}
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(Math.trunc(a));
+  b = Math.abs(Math.trunc(b));
+  while (b) [a, b] = [b, a % b];
+  return a || 1;
 }
 
 /**

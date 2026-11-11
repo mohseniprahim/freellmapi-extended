@@ -50,6 +50,45 @@ describe('OpenAICompatProvider', () => {
     expect(capturedBody.messages[0].role).toBe('user');
   });
 
+  it('uses OpenRouter dedicated image API with the configured model and returns image bytes', async () => {
+    const openrouter = new OpenAICompatProvider({
+      platform: 'openrouter',
+      name: 'OpenRouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      extraHeaders: { 'HTTP-Referer': 'https://whatsexpert.com', 'X-Title': 'WhatsExpert' },
+    });
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+    let capturedBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = url as string;
+      capturedHeaders = (init as any).headers;
+      capturedBody = JSON.parse((init as any).body);
+      return new Response(JSON.stringify({ data: [{ b64_json: 'aGVsbG8=', media_type: 'image/png' }] }));
+    });
+
+    const result = await openrouter.generateImage(
+      'openrouter-test-key', 'qwen/qwen-image-2.1-turbo', 'A teal abstract chat icon',
+      { n: 1, size: '1024x1024' },
+    );
+
+    expect(capturedUrl).toBe('https://openrouter.ai/api/v1/images');
+    expect(capturedHeaders.Authorization).toBe('Bearer openrouter-test-key');
+    expect(capturedHeaders['HTTP-Referer']).toBe('https://whatsexpert.com');
+    expect(capturedBody).toMatchObject({
+      model: 'qwen/qwen-image-2.1-turbo',
+      prompt: 'A teal abstract chat icon',
+      resolution: '1K',
+      aspect_ratio: '1:1',
+      n: 1,
+    });
+    expect(result).toEqual({ b64Images: ['aGVsbG8='], mimeType: 'image/png' });
+  });
+
+  it('does not enable image generation for other OpenAI-compatible providers', async () => {
+    await expect(provider.generateImage('key', 'model', 'prompt')).rejects.toThrow(/does not support image generation/);
+  });
+
   it('should pass tool-calling params through untouched', async () => {
     let capturedBody: any = null;
     vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
