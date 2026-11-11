@@ -77,7 +77,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
 });
 
 const modalityPlanSchema = z.object({
-  plan: z.enum(['text', 'audio', 'vision']),
+  plan: z.enum(['text', 'audio', 'vision', 'image_gen']),
   entries: z.array(z.object({
     modelDbId: z.number(),
     priority: z.number(),
@@ -96,12 +96,14 @@ fallbackRouter.get('/plans', (_req: Request, res: Response) => {
            m.size_label, m.rpm_limit, m.rpd_limit, m.monthly_token_budget, m.modality AS model_modality,
            m.vision_capable, m.audio_capable, m.supports_img2img, m.supports_inpainting,
            m.supports_json_mode, m.is_reasoning, m.image_routing_enabled, m.audio_routing_enabled,
-           m.price_input_per_1m, m.price_output_per_1m, m.price_per_call
+           m.price_input_per_1m, m.price_output_per_1m, m.price_per_call,
+           m.image_gen_capable, m.image_cost_class, m.image_cost_usd, m.image_cost_unit,
+           m.image_provider_tag, m.image_endpoint_available
       FROM fallback_modality_config frc
       JOIN models m ON m.id = frc.model_db_id
      ORDER BY frc.modality ASC, frc.priority ASC
   `).all() as any[];
-  const result: Record<string, unknown[]> = { text: [], audio: [], vision: [] };
+  const result: Record<string, unknown[]> = { text: [], audio: [], vision: [], image_gen: [] };
   for (const r of rows) {
     const penalty = penalties.get(r.model_db_id);
     (result[r.modality] ??= []).push({
@@ -130,6 +132,12 @@ fallbackRouter.get('/plans', (_req: Request, res: Response) => {
       supportsInpainting: r.supports_inpainting === 1,
       supportsJsonMode: r.supports_json_mode === 1,
       isReasoning: r.is_reasoning === 1,
+      imageGenCapable: r.image_gen_capable === 1,
+      imageCostClass: r.image_cost_class ?? 'unknown',
+      imageCostUsd: r.image_cost_usd == null ? null : Number(r.image_cost_usd),
+      imageCostUnit: r.image_cost_unit ?? null,
+      imageProviderTag: r.image_provider_tag ?? null,
+      imageEndpointAvailable: r.image_endpoint_available !== 0,
       isPaid: !String(r.model_id).endsWith(':free') && (Number(r.price_input_per_1m ?? 0) > 0 || Number(r.price_output_per_1m ?? 0) > 0 || Number(r.price_per_call ?? 0) > 0 || r.platform === 'openrouter'),
     });
   }

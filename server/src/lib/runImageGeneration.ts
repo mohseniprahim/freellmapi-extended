@@ -42,23 +42,20 @@ export interface ImageGenerationRunResult {
 
 // ---- Helpers ----
 
-/**
- * Pinned model resolver for image generation. Drops the pin when the pinned
- * model isn't image-gen (modality != 'image_gen') so we don't error out on
- * a chat-completion model id appearing on an /images request.
- */
+/** Pinned model resolver for image generation. Drop the pin when the requested
+ * model lacks the image-generation capability; a model can remain text-capable
+ * while also appearing in the independent image plan. */
 export function resolveImageGenModel(requestedModel: string | undefined): number | undefined {
   if (!requestedModel) return undefined;
   const db = getDb();
   // Caller may give the bare model id ("flux-1-schnell") or the full CF id
   // ("@cf/black-forest-labs/flux-1-schnell"). Match on full id first, then
   // suffix match for convenience.
-  const row = (db.prepare('SELECT id, enabled, modality FROM models WHERE model_id = ?').get(requestedModel)
-            ?? db.prepare("SELECT id, enabled, modality FROM models WHERE model_id LIKE ?").get(`%/${requestedModel}`)) as
-              { id: number; enabled: number; modality: string | null } | undefined;
+  const row = (db.prepare('SELECT id, modality, image_gen_capable FROM models WHERE model_id = ?').get(requestedModel)
+            ?? db.prepare("SELECT id, modality, image_gen_capable FROM models WHERE model_id LIKE ?").get(`%/${requestedModel}`)) as
+              { id: number; modality: string | null; image_gen_capable: number } | undefined;
   if (!row) throw new ModelNotFoundError(requestedModel, false);
-  if (!row.enabled) throw new ModelNotFoundError(requestedModel, true);
-  if (row.modality !== 'image_gen') {
+  if (row.modality !== 'image_gen' && row.image_gen_capable !== 1) {
     // Pin was a text model — drop and auto-route to image-gen.
     return undefined;
   }
@@ -99,7 +96,7 @@ export async function runImageGeneration(parsed: ImageGenerationRequest): Promis
         route.apiKey,
         route.modelId,
         prompt,
-        { n, size, negative_prompt, seed, quality },
+        { n, size, negative_prompt, seed, quality, providerOnly: route.imageProviderTag ?? undefined },
       );
 
       // Approximate neuron usage by row's neurons_per_call when present.

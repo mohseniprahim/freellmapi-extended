@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
-import { hasProvider } from '../providers/index.js';
+import { getAllProviders, hasProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 
 export const modelsRouter = Router();
@@ -67,6 +67,71 @@ modelsRouter.post('/sync-openrouter', async (_req: Request, res: Response) => {
   } catch (error: any) {
     res.status(502).json({ error: { message: error?.message ?? 'OpenRouter sync failed' } });
   }
+});
+
+/** Discover image-output models across every registered image provider and
+ *  update only image catalog metadata; text fallback rows/settings are untouched. */
+modelsRouter.post('/sync-images', async (_req: Request, res: Response) => {
+  const db = getDb();
+  const providerResults: Array<{ platform: string; discovered: number; added: number; enabled: number; error?: string; skipped?: string }> = [];
+  let totalDiscovered = 0;
+  let totalAdded = 0;
+  const providers = getAllProviders().filter(provider => provider.supportsImageGeneration);
+
+  for (const provider of providers) {
+    try {
+      const keyRow = db.prepare(`
+        SELECT encrypted_key, iv, auth_tag FROM api_keys
+        WHERE platform = ? AND enabled = 1 AND status != 'invalid' ORDER BY id ASC LIMIT 1
+      `).get(provider.platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+      const apiKey = keyRow ? decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag) : '';
+      const catalog = await provider.discoverImageModels(apiKey);
+      const insertModel = db.prepare(`
+        INSERT OR IGNORE INTO models (
+          platform, model_id, display_name, intelligence_rank, speed_rank,
+          size_label, monthly_token_budget, enabled, modality
+        ) VALUES (?, ?, ?, 100, 100, 'Image', 'image-generation', 1, 'image_gen')
+      `);
+      const findModel = db.prepare('SELECT id, image_endpoint_available FROM models WHERE platform = ? AND model_id = ?');
+      const updateModel = db.prepare(`
+        UPDATE models SET display_name = ?, image_gen_capable = 1,
+          image_cost_class = ?, image_cost_usd = ?, image_cost_unit = ?, image_provider_tag = ?,
+          image_endpoint_available = ? WHERE id = ?
+      `);
+      const nextPriority = db.prepare("SELECT COALESCE(MAX(priority), 0) + 1 AS priority FROM fallback_modality_config WHERE modality = 'image_gen'");
+      const addPlan = db.prepare(`
+        INSERT OR IGNORE INTO fallback_modality_config (modality, model_db_id, priority, enabled)
+        VALUES ('image_gen', ?, ?, ?)
+      `);
+      let added = 0;
+      let enabled = 0;
+      const sync = db.transaction(() => {
+        for (const item of catalog) {
+          if (!item.modelId) continue;
+          const result = insertModel.run(provider.platform, item.modelId, item.displayName);
+          if (result.changes > 0) added++;
+          const model = findModel.get(provider.platform, item.modelId) as { id: number; image_endpoint_available: number } | undefined;
+          if (!model) continue;
+          const available = item.available === undefined
+            ? (result.changes > 0 ? 0 : model.image_endpoint_available)
+            : item.available ? 1 : 0;
+          updateModel.run(item.displayName, item.priceClass, item.priceUsd ?? null,
+            item.priceUnit ?? null, item.providerTag ?? null, available, model.id);
+          const shouldEnable = available === 1 && item.enabledByDefault === true;
+          const priority = (nextPriority.get() as { priority: number }).priority;
+          const planRow = addPlan.run(model.id, priority, shouldEnable ? 1 : 0);
+          if (planRow.changes > 0 && shouldEnable) enabled++;
+        }
+      });
+      sync();
+      totalDiscovered += catalog.length;
+      totalAdded += added;
+      providerResults.push({ platform: provider.platform, discovered: catalog.length, added, enabled });
+    } catch (error: any) {
+      providerResults.push({ platform: provider.platform, discovered: 0, added: 0, enabled: 0, error: error?.message ?? 'فشل اكتشاف النماذج' });
+    }
+  }
+  res.json({ success: providerResults.some(result => !result.error && !result.skipped), totalDiscovered, totalAdded, providers: providerResults });
 });
 
 // List all models with availability info

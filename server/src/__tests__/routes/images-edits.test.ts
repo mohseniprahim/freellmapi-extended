@@ -31,10 +31,9 @@ describe('POST /v1/images/edits + /v1/images/variations', () => {
     app = createApp();
     key = getUnifiedApiKey();
     await request(app, '/api/keys', { platform: 'cloudflare', key: 'acct:tok', label: 'edits-e2e' }, key);
-    // V28 added CF flux-2-klein-9b as a higher-priority img2img model. The
-    // existing assertions here verify the Pollinations fallback path; pin the
-    // test fixture to Pollinations by disabling flux-2.
-    getDb().prepare("UPDATE models SET enabled=0 WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b'").run();
+    // This file asserts the Pollinations img2img fallback path. Disable Flux2
+    // through the independent image plan, not the global model switch.
+    getDb().prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id=(SELECT id FROM models WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b')").run();
   });
 
   beforeEach(() => {
@@ -132,11 +131,13 @@ describe('POST /v1/images/edits + /v1/images/variations', () => {
 
   it('400 when no inpainting model enabled', async () => {
     const db = getDb();
-    db.prepare("UPDATE models SET enabled = 0 WHERE supports_inpainting = 1").run();
+    const oldPlan = db.prepare("SELECT f.model_db_id, f.enabled FROM fallback_modality_config f JOIN models m ON m.id=f.model_db_id WHERE f.modality='image_gen' AND m.supports_inpainting=1").all() as Array<{ model_db_id: number; enabled: number }>;
+    db.prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id IN (SELECT id FROM models WHERE supports_inpainting=1)").run();
     const r = await request(app, '/v1/images/edits',
       { prompt: 'x', image: SRC_DATA_URL, mask: MASK_DATA_URL }, key);
     expect(r.status).toBe(400);
     expect(r.body.error.message).toMatch(/inpainting/i);
-    db.prepare("UPDATE models SET enabled = 1 WHERE platform='cloudflare' AND model_id='@cf/runwayml/stable-diffusion-v1-5-inpainting'").run();
+    const restore = db.prepare("UPDATE fallback_modality_config SET enabled=? WHERE modality='image_gen' AND model_db_id=?");
+    oldPlan.forEach(row => restore.run(row.enabled, row.model_db_id));
   });
 });

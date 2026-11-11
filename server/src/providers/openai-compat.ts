@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@myllm/shared/types.js';
-import { BaseProvider, type CompletionOptions, type EmbedOptions, type EmbedResult, type ImageGenerationOptions, type ImageGenerationResult } from './base.js';
+import { BaseProvider, type CompletionOptions, type EmbedOptions, type EmbedResult, type ImageGenerationOptions, type ImageGenerationResult, type ImageModelCatalogItem } from './base.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -21,6 +21,7 @@ export class OpenAICompatProvider extends BaseProvider {
   private readonly baseUrl: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
+  readonly supportsImageGeneration: boolean;
   /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted
    * inference (llama.cpp / vLLM on CPU) can take 30-120s for long prompts. Default 15000. */
   private readonly timeoutMs: number;
@@ -42,6 +43,7 @@ export class OpenAICompatProvider extends BaseProvider {
     this.validateUrl = opts.validateUrl;
     this.timeoutMs = opts.timeoutMs ?? 15000;
     this.requiresApiKey = opts.requiresApiKey ?? true;
+    this.supportsImageGeneration = opts.platform === 'openrouter';
   }
 
   /** Authorization header — omitted for keyless providers when apiKey is empty,
@@ -180,6 +182,72 @@ export class OpenAICompatProvider extends BaseProvider {
     return res.status !== 401 && res.status !== 403;
   }
 
+  async discoverImageModels(apiKey = ''): Promise<ImageModelCatalogItem[]> {
+    if (this.platform !== 'openrouter') return [];
+    const headers = apiKey ? this.authHeaders(apiKey) : {};
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/images/models`, {
+      method: 'GET',
+      headers: { ...headers, ...this.extraHeaders },
+    }, 30000);
+    if (!response.ok) throw new Error(`OpenRouter image catalog failed (${response.status})`);
+    const body = await response.json() as { data?: Array<{ id?: string; name?: string }> };
+    const catalog = (body.data ?? []).filter((m): m is { id: string; name?: string } => Boolean(m.id));
+    const results: Array<ImageModelCatalogItem | undefined> = new Array(catalog.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < catalog.length) {
+        const index = cursor++;
+        const model = catalog[index];
+        try {
+          const endpointResponse = await this.fetchWithTimeout(
+            `${this.baseUrl}/images/models/${model.id}/endpoints`,
+            { method: 'GET', headers: { ...headers, ...this.extraHeaders } },
+            20000,
+          );
+          if (!endpointResponse.ok) throw new Error(`HTTP ${endpointResponse.status}`);
+          const details = await endpointResponse.json() as {
+            endpoints?: Array<{ provider_tag?: string | null; provider_slug?: string; pricing?: Array<{ billable?: string; unit?: string; cost_usd?: number | string | null }> }>;
+          };
+          const endpoints = details.endpoints ?? [];
+          const outputPrices = endpoints.flatMap(endpoint => (endpoint.pricing ?? [])
+            .filter(price => price.billable === 'output_image' && price.cost_usd != null && price.cost_usd !== '' && Number.isFinite(Number(price.cost_usd)))
+            .map(price => ({
+              priceUsd: Number(price.cost_usd),
+              unit: price.unit ?? 'unknown',
+              // OpenRouter's Images API documents provider_tag as the exact
+              // route pin, while provider_slug is for endpoint options.
+              tag: endpoint.provider_tag ?? endpoint.provider_slug ?? null,
+            })));
+          const freePrices = outputPrices.filter(price => price.priceUsd === 0);
+          const candidatePrices = freePrices.length ? freePrices : outputPrices.filter(price => price.priceUsd > 0);
+          const unitRank = (unit: string) => unit === 'image' ? 0 : unit === 'megapixel' ? 1 : unit === 'token' ? 2 : 3;
+          candidatePrices.sort((a, b) => unitRank(a.unit) - unitRank(b.unit)
+            || a.priceUsd - b.priceUsd || String(a.tag).localeCompare(String(b.tag)));
+          const selected = candidatePrices[0];
+          const available = endpoints.length > 0;
+          results[index] = {
+            modelId: model.id,
+            displayName: model.name ?? model.id,
+            priceClass: freePrices.length ? 'free' : outputPrices.some(price => price.priceUsd > 0) ? 'paid' : 'unknown',
+            priceUsd: selected?.priceUsd ?? null,
+            priceUnit: selected?.unit ?? null,
+            providerTag: selected?.tag ?? null,
+            available,
+            // Keep one tested paid fallback active; additional paid/unknown
+            // models are discoverable but require explicit operator enablement.
+            enabledByDefault: model.id === 'qwen/qwen-image-2.1-turbo' && available,
+          };
+        } catch {
+          // A transient endpoint-catalog error must not overwrite a known
+          // working/free row as unavailable or erase its previously observed price.
+          results[index] = undefined;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, catalog.length) }, () => worker()));
+    return results.filter((item): item is ImageModelCatalogItem => item !== undefined);
+  }
+
   /**
    * OpenAI-compatible /v1/embeddings. Used by Mistral, Zhipu, GitHub Models,
    * NVIDIA NIM, OpenRouter, and any other provider whose embedding endpoint
@@ -269,6 +337,7 @@ export class OpenAICompatProvider extends BaseProvider {
       resolution: Math.max(width, height) > 1024 ? '2K' : '1K',
       aspect_ratio: aspectRatio,
       n: options?.n ?? 1,
+      ...(options?.providerOnly ? { provider: { only: [options.providerOnly], allow_fallbacks: false } } : {}),
     };
     const response = await this.fetchWithTimeout(`${this.baseUrl}/images`, {
       method: 'POST',

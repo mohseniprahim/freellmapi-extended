@@ -28,9 +28,25 @@ describe('routeRequest modality gate', () => {
   it('modality=image_gen picks an image-gen model', () => {
     insertKey('cloudflare');
     const route = routeRequest(100, undefined, undefined, false, false, false, 'image_gen');
-    const row = getDb().prepare('SELECT modality FROM models WHERE id = ?').get(route.modelDbId) as { modality: string };
-    expect(row.modality).toBe('image_gen');
-    expect(route.platform).toBe('cloudflare');
+    const row = getDb().prepare('SELECT modality, image_gen_capable FROM models WHERE id = ?').get(route.modelDbId) as { modality: string; image_gen_capable: number };
+    expect(row.modality === 'image_gen' || row.image_gen_capable === 1).toBe(true);
+    expect(['cloudflare', 'pollinations']).toContain(route.platform);
+  });
+
+  it('free image models always precede paid OpenRouter even when paid has higher manual priority', () => {
+    const db = getDb();
+    insertKey('openrouter');
+    const free = db.prepare("SELECT id FROM models WHERE platform = 'pollinations' AND image_gen_capable = 1").get() as { id: number } | undefined;
+    const paid = db.prepare("SELECT id FROM models WHERE platform = 'openrouter' AND model_id = 'qwen/qwen-image-2.1-turbo'").get() as { id: number } | undefined;
+    expect(free).toBeTruthy();
+    expect(paid).toBeTruthy();
+    db.prepare("UPDATE fallback_modality_config SET priority = 999, enabled = 1 WHERE modality = 'image_gen' AND model_db_id = ?").run(free!.id);
+    db.prepare("UPDATE fallback_modality_config SET priority = 1, enabled = 1 WHERE modality = 'image_gen' AND model_db_id = ?").run(paid!.id);
+    db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(free!.id);
+
+    const route = routeRequest(100, undefined, undefined, false, false, false, 'image_gen');
+    expect(route.platform).toBe('pollinations');
+    db.prepare('UPDATE models SET enabled = 1 WHERE id = ?').run(free!.id);
   });
 
   it('default text routing never picks image-gen models', () => {
@@ -43,13 +59,15 @@ describe('routeRequest modality gate', () => {
 
   it('no image-gen models enabled → throws 400', () => {
     const db = getDb();
-    db.prepare("UPDATE models SET enabled = 0 WHERE modality = 'image_gen'").run();
+    const oldPlan = db.prepare("SELECT model_db_id, enabled FROM fallback_modality_config WHERE modality = 'image_gen'").all() as Array<{ model_db_id: number; enabled: number }>;
+    db.prepare("UPDATE fallback_modality_config SET enabled = 0 WHERE modality = 'image_gen'").run();
     insertKey('cloudflare');
 
     expect(() => routeRequest(100, undefined, undefined, false, false, false, 'image_gen'))
       .toThrowError(/No image-generation models/);
 
-    db.prepare("UPDATE models SET enabled = 1 WHERE modality = 'image_gen'").run();
+    const restore = db.prepare("UPDATE fallback_modality_config SET enabled = ? WHERE modality = 'image_gen' AND model_db_id = ?");
+    oldPlan.forEach(row => restore.run(row.enabled, row.model_db_id));
   });
 });
 

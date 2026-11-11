@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   ChatContentPart,
 } from '@myllm/shared/types.js';
-import { BaseProvider, type CompletionOptions, type ImageGenerationOptions, type ImageGenerationResult, type ImageEditOptions, type AudioTranscribeOptions, type AudioTranscribeResult, type EmbedOptions, type EmbedResult, type TtsOptions, type TtsResult } from './base.js';
+import { BaseProvider, type CompletionOptions, type ImageGenerationOptions, type ImageGenerationResult, type ImageEditOptions, type AudioTranscribeOptions, type AudioTranscribeResult, type EmbedOptions, type EmbedResult, type TtsOptions, type TtsResult, type ImageModelCatalogItem } from './base.js';
 
 const AUDIO_TIMEOUT_MS = Number(process.env.MYLLM_AUDIO_TIMEOUT_MS ?? 120_000);
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25 MB — OpenAI Whisper limit shape
@@ -136,6 +136,7 @@ async function inlineRemoteImages(messages: ChatMessage[]): Promise<ChatMessage[
 export class CloudflareProvider extends BaseProvider {
   readonly platform = 'cloudflare' as const;
   readonly name = 'Cloudflare Workers AI';
+  readonly supportsImageGeneration = true;
 
   private parseKey(apiKey: string): { accountId: string; token: string } {
     const sep = apiKey.indexOf(':');
@@ -264,6 +265,33 @@ export class CloudflareProvider extends BaseProvider {
     if (!res.ok) return true; // unexpected non-2xx that isn't auth — don't disable
     const data = await res.json() as any;
     return data.success === true && data.result?.status === 'active';
+  }
+
+  async discoverImageModels(apiKey = ''): Promise<ImageModelCatalogItem[]> {
+    if (!apiKey) return [];
+    const { accountId, token } = this.parseKey(apiKey);
+    const params = new URLSearchParams({ task: 'Text-to-Image', per_page: '100' });
+    const response = await this.fetchWithTimeout(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search?${params}`,
+      { method: 'GET', headers: { Authorization: `Bearer ${token}` } },
+      20000,
+    );
+    if (!response.ok) throw new Error(`Cloudflare image catalog failed (${response.status})`);
+    const body = await response.json() as { result?: Array<any> };
+    return (body.result ?? []).flatMap((model): ImageModelCatalogItem[] => {
+      const modelId = String(model.name ?? model.id ?? '');
+      const task = typeof model.task === 'string' ? model.task : String(model.task?.name ?? '');
+      if (!modelId || !task.toLowerCase().includes('text-to-image')) return [];
+      return [{
+        modelId,
+        displayName: `${String(model.name ?? modelId)} (Cloudflare)`,
+        priceClass: 'free',
+        priceUsd: null,
+        priceUnit: 'neurons/quota',
+        available: true,
+        enabledByDefault: true,
+      }];
+    });
   }
 
   /**

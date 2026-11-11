@@ -122,6 +122,7 @@ export function initDb(dbPath?: string): Database.Database {
   // reading measured health/latency that the requests table now carries.
   migrateModelsV57BalancedRerank(db);
   migrateModelsV65OpenRouterImage(db);
+  migrateImageFallbackPlanV66(db);
 
   // Older deployments regenerated settings.unified_api_key without updating
   // client_keys. Backfill the current value once per missing hash so existing
@@ -170,6 +171,74 @@ function migrateModelsV65OpenRouterImage(db: Database.Database) {
     db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)')
       .run(model.id, (firstImage.priority ?? 1) - 1);
   }
+}
+
+/** V66: separate image generation from text/vision and store image pricing and
+ *  endpoint metadata. Enable available free routes and the tested Qwen paid
+ *  fallback by default; leave other paid or unpriced routes for operator review. */
+function migrateImageFallbackPlanV66(db: Database.Database) {
+  const addColumn = (sql: string) => {
+    try { db.exec(sql); }
+    catch (error: any) { if (!String(error?.message ?? '').includes('duplicate column')) throw error; }
+  };
+  addColumn('ALTER TABLE models ADD COLUMN image_gen_capable INTEGER NOT NULL DEFAULT 0');
+  addColumn("ALTER TABLE models ADD COLUMN image_cost_class TEXT NOT NULL DEFAULT 'unknown'");
+  addColumn('ALTER TABLE models ADD COLUMN image_cost_usd REAL');
+  addColumn('ALTER TABLE models ADD COLUMN image_cost_unit TEXT');
+  addColumn('ALTER TABLE models ADD COLUMN image_provider_tag TEXT');
+  addColumn('ALTER TABLE models ADD COLUMN image_endpoint_available INTEGER NOT NULL DEFAULT 1');
+
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fallback_modality_config'").get() as { sql?: string } | undefined;
+  if (table?.sql && !table.sql.includes("'image_gen'")) {
+    db.transaction(() => db.exec(`
+      CREATE TABLE fallback_modality_config_v66 (
+        modality TEXT NOT NULL CHECK (modality IN ('text', 'audio', 'vision', 'image_gen')),
+        model_db_id INTEGER NOT NULL REFERENCES models(id),
+        priority INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (modality, model_db_id)
+      );
+      INSERT OR IGNORE INTO fallback_modality_config_v66 (modality, model_db_id, priority, enabled)
+        SELECT modality, model_db_id, priority, enabled FROM fallback_modality_config;
+      DROP TABLE fallback_modality_config;
+      ALTER TABLE fallback_modality_config_v66 RENAME TO fallback_modality_config;
+    `))();
+  }
+
+  db.prepare(`
+    UPDATE models SET image_gen_capable = 1,
+      image_cost_class = CASE
+        WHEN platform IN ('cloudflare', 'pollinations') THEN 'free'
+        WHEN platform = 'openrouter' THEN 'paid'
+        ELSE 'unknown'
+      END
+    WHERE modality = 'image_gen' AND image_cost_class = 'unknown'
+  `).run();
+  db.prepare("UPDATE models SET image_cost_usd = 0.0184, image_cost_unit = 'image', image_provider_tag = 'alibaba' WHERE platform = 'openrouter' AND model_id = 'qwen/qwen-image-2.1-turbo'").run();
+  db.prepare("UPDATE models SET image_endpoint_available = 0 WHERE platform = 'zhipu' AND modality = 'image_gen'").run();
+
+  const migrated = db.prepare("SELECT value FROM settings WHERE key = 'migration_v66_image_plan'").get() as { value: string } | undefined;
+  if (migrated?.value === 'done') return;
+  const rows = db.prepare(`
+    SELECT m.id, m.model_id, m.image_cost_class, m.image_cost_usd, m.image_endpoint_available,
+           fc.priority AS old_priority
+    FROM models m LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+    WHERE m.image_gen_capable = 1
+  `).all() as Array<{ id: number; model_id: string; image_cost_class: string; image_cost_usd: number | null; image_endpoint_available: number; old_priority: number | null }>;
+  const tier = (value: string) => value === 'free' ? 0 : value === 'paid' ? 1 : 2;
+  rows.sort((a, b) => tier(a.image_cost_class) - tier(b.image_cost_class)
+    || (a.old_priority ?? Number.MAX_SAFE_INTEGER) - (b.old_priority ?? Number.MAX_SAFE_INTEGER)
+    || (a.image_cost_usd ?? Number.MAX_SAFE_INTEGER) - (b.image_cost_usd ?? Number.MAX_SAFE_INTEGER)
+    || a.id - b.id);
+  const insert = db.prepare("INSERT OR IGNORE INTO fallback_modality_config (modality, model_db_id, priority, enabled) VALUES ('image_gen', ?, ?, ?)");
+  db.transaction(() => {
+    rows.forEach((row, index) => {
+      const enabled = row.image_endpoint_available === 1
+        && (row.image_cost_class === 'free' || row.model_id === 'qwen/qwen-image-2.1-turbo');
+      insert.run(row.id, index + 1, enabled ? 1 : 0);
+    });
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_v66_image_plan', 'done')").run();
+  })();
 }
 
 function createTables(db: Database.Database) {
@@ -226,7 +295,7 @@ function createTables(db: Database.Database) {
     );
 
     CREATE TABLE IF NOT EXISTS fallback_modality_config (
-      modality TEXT NOT NULL CHECK (modality IN ('text', 'audio', 'vision')),
+      modality TEXT NOT NULL CHECK (modality IN ('text', 'audio', 'vision', 'image_gen')),
       model_db_id INTEGER NOT NULL REFERENCES models(id),
       priority INTEGER NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1,

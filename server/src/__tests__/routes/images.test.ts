@@ -29,10 +29,9 @@ describe('POST /v1/images/generations', () => {
     key = getUnifiedApiKey();
     // Seed a Cloudflare key so image-gen has a route
     await request(app, 'POST', '/api/keys', { platform: 'cloudflare', key: 'acct:token', label: 'imagegen-e2e' });
-    // V28: disable flux-2-klein-9b for these tests - they assert against the
-    // legacy JSON-body SD image-gen path; flux-2 uses multipart instead.
-    // Coverage for flux-2 lives in providers/cloudflare-imagegen.test.ts.
-    getDb().prepare("UPDATE models SET enabled=0 WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b'").run();
+    // Keep these tests on the legacy JSON-body image path; Flux 2 uses
+    // multipart. Image routing is controlled by its own fallback plan.
+    getDb().prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id=(SELECT id FROM models WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b')").run();
   });
 
   beforeEach(() => {
@@ -109,10 +108,12 @@ describe('POST /v1/images/generations', () => {
 
   it('400 when no image-gen model enabled', async () => {
     const db = getDb();
-    db.prepare("UPDATE models SET enabled = 0 WHERE modality = 'image_gen'").run();
+    const oldPlan = db.prepare("SELECT model_db_id, enabled FROM fallback_modality_config WHERE modality = 'image_gen'").all() as Array<{ model_db_id: number; enabled: number }>;
+    db.prepare("UPDATE fallback_modality_config SET enabled = 0 WHERE modality = 'image_gen'").run();
     const r = await request(app, 'POST', '/v1/images/generations', { prompt: 'a cat' }, key);
     expect(r.status).toBe(400);
     expect(r.body.error.message).toMatch(/No image-generation/);
-    db.prepare("UPDATE models SET enabled = 1 WHERE modality = 'image_gen'").run();
+    const restore = db.prepare("UPDATE fallback_modality_config SET enabled = ? WHERE modality = 'image_gen' AND model_db_id = ?");
+    oldPlan.forEach(row => restore.run(row.enabled, row.model_db_id));
   });
 });

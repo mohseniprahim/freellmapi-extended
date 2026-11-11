@@ -3,7 +3,7 @@ import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
 } from '@myllm/shared/types.js';
-import { BaseProvider, type ImageGenerationOptions, type ImageGenerationResult, type ImageEditOptions } from './base.js';
+import { BaseProvider, type ImageGenerationOptions, type ImageGenerationResult, type ImageEditOptions, type ImageModelCatalogItem } from './base.js';
 import { storeImage } from '../services/imageStorage.js';
 
 const POLLINATIONS_TIMEOUT_MS = Number(process.env.MYLLM_POLLINATIONS_TIMEOUT_MS ?? 60_000);
@@ -24,6 +24,21 @@ export class PollinationsProvider extends BaseProvider {
   readonly platform = 'pollinations' as const;
   readonly name = 'Pollinations.ai';
   readonly requiresApiKey = false;
+  readonly supportsImageGeneration = true;
+
+  async discoverImageModels(): Promise<ImageModelCatalogItem[]> {
+    // V41's live probe found only `flux` is a distinct working route; the
+    // other historical names silently fell through to the same backend.
+    return [{
+      modelId: 'pollinations/flux',
+      displayName: 'Pollinations Flux',
+      priceClass: 'free',
+      priceUsd: 0,
+      priceUnit: 'image',
+      available: true,
+      enabledByDefault: true,
+    }];
+  }
 
   async chatCompletion(): Promise<ChatCompletionResponse> {
     throw new Error('Pollinations.ai does not support chat completion');

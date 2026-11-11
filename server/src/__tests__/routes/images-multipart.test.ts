@@ -54,9 +54,8 @@ describe('POST /v1/images/edits multipart/form-data', () => {
     const enc = encrypt('acct:tok');
     getDb().prepare(`INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES ('cloudflare','mp-test',?,?,?,'healthy',1)`).run(enc.encrypted, enc.iv, enc.authTag);
-    // V28: disable flux-2-klein-9b so the Pollinations img2img path stays
-    // the route under test. Default routing prefers flux-2 over Pollinations.
-    getDb().prepare("UPDATE models SET enabled=0 WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b'").run();
+    // Keep the Pollinations img2img route under test using the image-only plan.
+    getDb().prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id=(SELECT id FROM models WHERE model_id='@cf/black-forest-labs/flux-2-klein-9b')").run();
   });
 
   beforeEach(() => {

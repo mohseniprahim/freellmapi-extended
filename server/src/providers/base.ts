@@ -33,6 +33,20 @@ export interface ImageGenerationOptions {
   negative_prompt?: string;
   seed?: number;
   quality?: 'standard' | 'hd';
+  /** Internal routing pin for a specific upstream endpoint when catalog data
+   *  shows that it is free or is the cheapest supported endpoint. */
+  providerOnly?: string;
+}
+
+export interface ImageModelCatalogItem {
+  modelId: string;
+  displayName: string;
+  priceClass: 'free' | 'paid' | 'unknown';
+  priceUsd?: number | null;
+  priceUnit?: string | null;
+  providerTag?: string | null;
+  available?: boolean;
+  enabledByDefault?: boolean;
 }
 
 export interface ImageEditOptions {
@@ -122,6 +136,7 @@ export interface EmbedResult {
 export abstract class BaseProvider {
   abstract readonly platform: Platform;
   abstract readonly name: string;
+  readonly supportsImageGeneration: boolean = false;
   // Default: provider needs a stored api_keys row. Pollinations and other
   // keyless services override this to false so the router can route to them
   // without a configured key.
@@ -142,6 +157,13 @@ export abstract class BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk>;
 
   abstract validateKey(apiKey: string): Promise<boolean>;
+
+  /** Providers that support image generation can expose their live/static
+   *  image-output catalog here. Returning [] leaves the provider out of the
+   *  image plan; image-input/vision support alone is not image generation. */
+  async discoverImageModels(_apiKey = ''): Promise<ImageModelCatalogItem[]> {
+    return [];
+  }
 
   // Optional image generation. Default throws — providers override to add
   // support. Routing's modality filter ensures this is only called on

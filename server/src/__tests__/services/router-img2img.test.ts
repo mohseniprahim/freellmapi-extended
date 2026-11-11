@@ -40,24 +40,28 @@ describe('router img2img + inpainting gate', () => {
 
   it('throws 400 when no inpainting model enabled', () => {
     const db = getDb();
-    db.prepare("UPDATE models SET enabled = 0 WHERE supports_inpainting = 1").run();
+    const oldPlan = db.prepare("SELECT f.model_db_id, f.enabled FROM fallback_modality_config f JOIN models m ON m.id=f.model_db_id WHERE f.modality='image_gen' AND m.supports_inpainting=1").all() as Array<{ model_db_id: number; enabled: number }>;
+    db.prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id IN (SELECT id FROM models WHERE supports_inpainting=1)").run();
     insertKey('cloudflare');
 
     expect(() => routeRequest(100, undefined, undefined, false, false, false, 'image_gen',
       { requireInpainting: true })).toThrowError(/No inpainting/);
 
-    db.prepare("UPDATE models SET enabled = 1 WHERE platform='cloudflare' AND model_id='@cf/runwayml/stable-diffusion-v1-5-inpainting'").run();
+    const restore = db.prepare("UPDATE fallback_modality_config SET enabled=? WHERE modality='image_gen' AND model_db_id=?");
+    oldPlan.forEach(row => restore.run(row.enabled, row.model_db_id));
   });
 
   it('throws 400 when no img2img model enabled', () => {
     const db = getDb();
-    db.prepare("UPDATE models SET enabled = 0 WHERE supports_img2img = 1").run();
+    const oldPlan = db.prepare("SELECT f.model_db_id, f.enabled FROM fallback_modality_config f JOIN models m ON m.id=f.model_db_id WHERE f.modality='image_gen' AND m.supports_img2img=1").all() as Array<{ model_db_id: number; enabled: number }>;
+    db.prepare("UPDATE fallback_modality_config SET enabled=0 WHERE modality='image_gen' AND model_db_id IN (SELECT id FROM models WHERE supports_img2img=1)").run();
     insertKey('cloudflare');
 
     expect(() => routeRequest(100, undefined, undefined, false, false, false, 'image_gen',
       { requireImg2Img: true })).toThrowError(/No img2img/);
 
-    db.prepare("UPDATE models SET enabled = 1").run();
+    const restore = db.prepare("UPDATE fallback_modality_config SET enabled=? WHERE modality='image_gen' AND model_db_id=?");
+    oldPlan.forEach(row => restore.run(row.enabled, row.model_db_id));
   });
 
   it('regular image_gen request unaffected by img2img filter', () => {

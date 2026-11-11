@@ -1,5 +1,5 @@
 import { OpenAICompatProvider } from './openai-compat.js';
-import type { ImageGenerationOptions, ImageGenerationResult } from './base.js';
+import type { ImageGenerationOptions, ImageGenerationResult, ImageModelCatalogItem } from './base.js';
 
 const ZHIPU_BASE = 'https://open.bigmodel.cn/api/paas/v4';
 const ZHIPU_IMAGE_TIMEOUT_MS = Number(process.env.MYLLM_ZHIPU_IMAGE_TIMEOUT_MS ?? 60_000);
@@ -18,12 +18,27 @@ const ZHIPU_IMAGE_TIMEOUT_MS = Number(process.env.MYLLM_ZHIPU_IMAGE_TIMEOUT_MS ?
  * response.
  */
 export class ZhipuProvider extends OpenAICompatProvider {
+  readonly supportsImageGeneration = true;
+
   constructor() {
     super({
       platform: 'zhipu',
       name: 'Zhipu AI',
       baseUrl: ZHIPU_BASE,
     });
+  }
+
+  async discoverImageModels(): Promise<ImageModelCatalogItem[]> {
+    // Keep historical CogView entries visible for operator review, but do not
+    // enable them by default: V41 disabled these after confirmed live failures.
+    return ['cogview-3', 'cogview-3-flash', 'cogview-3-plus'].map(modelId => ({
+      modelId,
+      displayName: `Zhipu ${modelId}`,
+      priceClass: 'unknown',
+      priceUnit: null,
+      available: false,
+      enabledByDefault: false,
+    }));
   }
 
   async generateImage(

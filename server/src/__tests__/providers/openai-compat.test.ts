@@ -69,7 +69,7 @@ describe('OpenAICompatProvider', () => {
 
     const result = await openrouter.generateImage(
       'openrouter-test-key', 'qwen/qwen-image-2.1-turbo', 'A teal abstract chat icon',
-      { n: 1, size: '1024x1024' },
+      { n: 1, size: '1024x1024', providerOnly: 'alibaba' },
     );
 
     expect(capturedUrl).toBe('https://openrouter.ai/api/v1/images');
@@ -81,8 +81,40 @@ describe('OpenAICompatProvider', () => {
       resolution: '1K',
       aspect_ratio: '1:1',
       n: 1,
+      provider: { only: ['alibaba'], allow_fallbacks: false },
     });
     expect(result).toEqual({ b64Images: ['aGVsbG8='], mimeType: 'image/png' });
+  });
+
+  it('discovers image models and classifies free versus paid endpoints', async () => {
+    const openrouter = new OpenAICompatProvider({
+      platform: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1',
+    });
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      const target = String(url);
+      if (target.endsWith('/images/models')) {
+        return new Response(JSON.stringify({ data: [
+          { id: 'vendor/free-image', name: 'Free Image' },
+          { id: 'vendor/paid-image', name: 'Paid Image' },
+        ] }));
+      }
+      if (target.endsWith('/images/models/vendor/free-image/endpoints')) {
+        return new Response(JSON.stringify({ endpoints: [{
+          provider_tag: 'vendor/free', provider_slug: 'vendor',
+          pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0 }],
+        }] }));
+      }
+      return new Response(JSON.stringify({ endpoints: [{
+        provider_tag: 'vendor/paid', provider_slug: 'vendor',
+        pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.04 }],
+      }] }));
+    });
+
+    const catalog = await openrouter.discoverImageModels();
+    expect(catalog).toMatchObject([
+      { modelId: 'vendor/free-image', priceClass: 'free', priceUsd: 0, providerTag: 'vendor/free', available: true },
+      { modelId: 'vendor/paid-image', priceClass: 'paid', priceUsd: 0.04, providerTag: 'vendor/paid', available: true },
+    ]);
   });
 
   it('does not enable image generation for other OpenAI-compatible providers', async () => {

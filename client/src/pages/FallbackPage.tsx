@@ -49,16 +49,24 @@ interface FallbackEntry {
   supportsJsonMode: boolean
   isReasoning: boolean
   isPaid: boolean
+  imageCostClass?: 'free' | 'paid' | 'unknown'
+  imageCostUsd?: number | null
+  imageCostUnit?: string | null
+  imageProviderTag?: string | null
+  imageEndpointAvailable?: boolean
 }
 
-type PlanName = 'text' | 'audio' | 'vision'
+type PlanName = 'text' | 'audio' | 'vision' | 'image_gen'
 type FallbackPlans = Record<PlanName, FallbackEntry[]>
 
 const PLAN_LABELS: Record<PlanName, { title: string; description: string }> = {
   text: { title: 'Text', description: 'رسائل النص العادية' },
   audio: { title: 'Audio', description: 'التسجيلات الصوتية فقط' },
   vision: { title: 'Image / Vision', description: 'الصور والمرفقات المرئية' },
+  image_gen: { title: 'Image generation', description: 'توليد الصور: المجاني أولاً ثم المدفوع' },
 }
+
+const imageTier = (entry: FallbackEntry) => entry.imageCostClass === 'free' ? 0 : entry.imageCostClass === 'paid' ? 1 : 2
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
@@ -224,11 +232,13 @@ function TokenUsageBar({ data }: { data: BudgetView }) {
 function SortableModelRow({
   entry,
   index,
+  plan,
   onToggle,
   onMove,
 }: {
   entry: FallbackEntry
   index: number
+  plan: PlanName
   onToggle: (modelDbId: number, enabled: boolean) => void
   onMove: (modelDbId: number, direction: 'up' | 'down') => void
 }) {
@@ -240,6 +250,7 @@ function SortableModelRow({
     transform: CSS.Transform.toString(transform),
     transition,
   }
+  const imagePriceUnknown = plan === 'image_gen' && (!entry.imageCostClass || entry.imageCostClass === 'unknown')
 
   return (
     <div
@@ -264,11 +275,17 @@ function SortableModelRow({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-medium text-sm">{entry.displayName}</span>
           <span className="text-xs text-muted-foreground">{entry.platform}</span>
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${entry.isPaid
-            ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200'
-            : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'}`}>
-            {entry.isPaid ? 'PAID' : 'FREE'}
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${imagePriceUnknown
+            ? 'bg-muted text-muted-foreground'
+            : (plan === 'image_gen' ? entry.imageCostClass === 'paid' : entry.isPaid)
+              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200'
+              : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'}`}>
+            {plan === 'image_gen'
+              ? entry.imageCostClass === 'free' ? 'مجاني' : entry.imageCostClass === 'paid' ? 'مدفوع' : 'السعر غير معروف'
+              : entry.isPaid ? 'PAID' : 'FREE'}
           </span>
+          {plan === 'image_gen' && entry.imageEndpointAvailable === false && <span className="text-[10px] text-muted-foreground">غير متاح حاليًا</span>}
+          {plan === 'image_gen' && entry.imageProviderTag && <span className="text-[10px] text-muted-foreground">{entry.imageProviderTag}</span>}
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
             {entry.modality === 'audio_stt' ? 'STT' : entry.modality === 'audio_tts' ? 'TTS' : entry.modality}
           </span>
@@ -294,6 +311,9 @@ function SortableModelRow({
               ? `${entry.monthlyTokenBudget} tok/mo`
               : '∞ tok/mo (RPM-capped)'}
           </span>
+          {plan === 'image_gen' && entry.imageCostUsd != null && (
+            <span>{`$${entry.imageCostUsd} / ${entry.imageCostUnit ?? 'unit'}`}</span>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-1" aria-label="Change model priority">
@@ -312,6 +332,7 @@ export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [activePlan, setActivePlan] = useState<PlanName>('text')
   const [localPlans, setLocalPlans] = useState<Partial<FallbackPlans> | null>(null)
+  const [imageSyncMessage, setImageSyncMessage] = useState('')
 
   const { data: plans, isLoading } = useQuery<FallbackPlans>({
     queryKey: ['fallback', 'plans'],
@@ -340,7 +361,21 @@ export default function FallbackPage() {
     },
   })
 
-  const allEntries = localPlans?.[activePlan] ?? plans?.[activePlan] ?? []
+  const syncImagesMutation = useMutation({
+    mutationFn: () => apiFetch('/api/models/sync-images', { method: 'POST' }),
+    onSuccess: (result: any) => {
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'plans'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      setLocalPlans(null)
+      setImageSyncMessage(`تم اكتشاف ${result?.totalDiscovered ?? 0} نموذج صورة، وإضافة ${result?.totalAdded ?? 0} جديد.`)
+    },
+    onError: (error: any) => setImageSyncMessage(`فشل التحديث التلقائي: ${error?.message ?? 'خطأ غير معروف'}`),
+  })
+
+  const sourceEntries = localPlans?.[activePlan] ?? plans?.[activePlan] ?? []
+  const allEntries = activePlan === 'image_gen'
+    ? [...sourceEntries].sort((a, b) => imageTier(a) - imageTier(b) || a.priority - b.priority)
+    : sourceEntries
   // Never hide catalog rows just because a provider key is missing. Paid
   // OpenRouter models must remain visible so the operator can configure them.
   const displayEntries = allEntries
@@ -356,6 +391,7 @@ export default function FallbackPage() {
     if (!over || active.id === over.id) return
     const oldIndex = displayEntries.findIndex(e => e.modelDbId === active.id)
     const newIndex = displayEntries.findIndex(e => e.modelDbId === over.id)
+    if (activePlan === 'image_gen' && imageTier(displayEntries[oldIndex]) !== imageTier(displayEntries[newIndex])) return
     const reorderedVisible = arrayMove(displayEntries, oldIndex, newIndex)
     // displayEntries currently contains the complete catalog, including rows
     // without configured keys. Appending those rows again creates duplicate
@@ -374,6 +410,7 @@ export default function FallbackPage() {
     const index = allEntries.findIndex(e => e.modelDbId === modelDbId)
     const nextIndex = direction === 'up' ? index - 1 : index + 1
     if (index < 0 || nextIndex < 0 || nextIndex >= allEntries.length) return
+    if (activePlan === 'image_gen' && imageTier(allEntries[index]) !== imageTier(allEntries[nextIndex])) return
     const reordered = arrayMove(allEntries, index, nextIndex)
     setLocalPlans({ ...(localPlans ?? {}), [activePlan]: reordered.map((entry, i) => ({ ...entry, priority: i + 1 })) })
   }
@@ -401,6 +438,11 @@ export default function FallbackPage() {
             <Button variant="outline" size="sm" onClick={() => syncOpenRouterMutation.mutate()} disabled={syncOpenRouterMutation.isPending}>
               {syncOpenRouterMutation.isPending ? 'Syncing OpenRouter…' : 'Sync OpenRouter models'}
             </Button>
+            {activePlan === 'image_gen' && (
+              <Button variant="outline" size="sm" onClick={() => syncImagesMutation.mutate()} disabled={syncImagesMutation.isPending}>
+                {syncImagesMutation.isPending ? 'جارٍ فحص النماذج…' : 'تحديث تلقائي لنماذج الصور'}
+              </Button>
+            )}
           </>
         }
       />
@@ -422,6 +464,8 @@ export default function FallbackPage() {
         <div className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
           ترتيب وتفعيل خطة <strong className="text-foreground">{PLAN_LABELS[activePlan].title}</strong> مستقل عن الخطط الأخرى. يمكن استخدام النموذج نفسه في أكثر من خطة.
         </div>
+        {activePlan === 'image_gen' && <div className="text-xs text-muted-foreground">سيتم تجربة النماذج المجانية أولًا تلقائيًا، حتى لو كان ترتيب نموذج مدفوع أعلى. يُستخدم المدفوع بعد تعذّر المجاني. يمكنك إعادة ترتيب النماذج داخل كل فئة سعرية فقط.</div>}
+        {activePlan === 'image_gen' && imageSyncMessage && <div role="status" className="text-sm text-muted-foreground">{imageSyncMessage}</div>}
         {/* TEXT modality — monthly + daily token budgets */}
         {tokenUsage && tokenUsage.totalBudget > 0 && (
           <TokenUsageBar
@@ -622,6 +666,7 @@ export default function FallbackPage() {
                       key={entry.modelDbId}
                       entry={entry}
                       index={index}
+                      plan={activePlan}
                       onToggle={handleToggle}
                       onMove={handleMove}
                     />

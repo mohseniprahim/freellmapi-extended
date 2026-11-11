@@ -22,6 +22,10 @@ interface ModelRow {
   neurons_per_call?: number | null;
   supports_img2img?: number;
   supports_inpainting?: number;
+  image_gen_capable?: number;
+  image_cost_class?: string;
+  image_endpoint_available?: number;
+  image_provider_tag?: string | null;
 }
 
 export type Modality = 'text' | 'image_gen' | 'audio_stt' | 'audio_tts' | 'embedding' | 'rerank';
@@ -60,6 +64,7 @@ export interface RouteResult {
   /** 1-based intelligence rank (lower = stronger). Used to give frontier
    *  models a longer HTTP timeout. */
   intelligenceRank: number;
+  imageProviderTag?: string | null;
 }
 
 export interface ChatCascadeOptions {
@@ -175,8 +180,8 @@ export function routeRequest(
   // content:null with finish_reason=length, which breaks downstream parsers.
   // Caller opts in with `extra.allow_reasoning`, or pins the model explicitly.
   excludeReasoning = false,
-  // 'text' (default) selects chat-completion models; 'image_gen' selects
-  // image generation models. Filter routed to models.modality column.
+  // 'text' (default) selects chat-completion models; 'image_gen' uses its
+  // own plan and capability flag, independent of text/vision plan settings.
   modality: Modality = 'text',
   // Image-op gate. Only meaningful when modality='image_gen'. Forces a model
   // that declares supports_img2img or supports_inpainting respectively.
@@ -202,7 +207,8 @@ export function routeRequest(
   // Each modality has its own independent plan. The same model may therefore
   // appear in Text, Audio, and Vision with different priorities or enabled
   // states, exactly as an operator configures it in the admin UI.
-  const routePlan = requireVision ? 'vision' : (requireAudio || modality === 'audio_stt' ? 'audio' : 'text');
+  const routePlan = modality === 'image_gen' ? 'image_gen'
+    : requireVision ? 'vision' : (requireAudio || modality === 'audio_stt' ? 'audio' : 'text');
   const fallbackChain = routePlan === 'text'
     ? db.prepare(`
         SELECT fc.model_db_id, fc.priority, fc.enabled
@@ -217,7 +223,7 @@ export function routeRequest(
       `).all(routePlan) as FallbackRow[];
 
   // Apply dynamic penalties: sort by (base priority + penalty)
-  let sortedChain: Array<{ model_db_id: number; priority: number; enabled: number }> =
+  let sortedChain: Array<{ model_db_id: number; priority: number; enabled: number; effectivePriority: number }> =
     fallbackChain.map(entry => ({
       ...entry,
       effectivePriority: entry.priority + getPenalty(entry.model_db_id),
@@ -285,6 +291,20 @@ export function routeRequest(
     });
   }
 
+  // Free image routes (including free quotas) always precede known paid
+  // endpoints. Manual pinning is the only way to bypass this policy. UI
+  // priority controls quality/order *within* each price tier.
+  if (modality === 'image_gen' && preferredModelDbId === undefined) {
+    const imagePricing = new Map((db.prepare('SELECT id, image_cost_class FROM models').all() as
+      Array<{ id: number; image_cost_class: string }>).map(m => [m.id, m.image_cost_class]));
+    const imageTier = (id: number) => {
+      const priceClass = imagePricing.get(id);
+      return priceClass === 'free' ? 0 : priceClass === 'paid' ? 1 : 2;
+    };
+    sortedChain.sort((a, b) => imageTier(a.model_db_id) - imageTier(b.model_db_id)
+      || a.effectivePriority - b.effectivePriority);
+  }
+
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
     if (skipModels?.has(entry.model_db_id)) continue;
@@ -294,9 +314,9 @@ export function routeRequest(
     // Get model details. Flags layered: vision (image content present) and
     // json mode (structured-output request). Reasoning models are excluded
     // from JSON mode because their thinking trace burns the token budget.
-    const whereParts: string[] = ['id = ?', 'enabled = 1'];
+    const whereParts: string[] = ['id = ?'];
     if (modality === 'image_gen') {
-      whereParts.push("modality = 'image_gen'");
+      whereParts.push('image_gen_capable = 1', 'image_endpoint_available = 1');
       if (imageOps?.requireInpainting) whereParts.push('supports_inpainting = 1');
       else if (imageOps?.requireImg2Img) whereParts.push('supports_img2img = 1');
     } else if (modality === 'audio_stt') {
@@ -313,6 +333,9 @@ export function routeRequest(
       // accidentally pick an image-gen / audio / embedding model.
       whereParts.push("(modality = 'text' OR modality IS NULL)");
     }
+    // Global model enablement belongs to the text/catalog switch; image
+    // generation is enabled independently through fallback_modality_config.
+    if (modality !== 'image_gen') whereParts.push('enabled = 1');
     if (requireVision)    whereParts.push('vision_capable = 1');
     if (requireAudio)     whereParts.push('audio_capable = 1');
     if (requireJsonMode)  whereParts.push('supports_json_mode = 1', 'is_reasoning = 0');
@@ -392,6 +415,7 @@ export function routeRequest(
         platform: model.platform,
         displayName: model.display_name,
         intelligenceRank: model.intelligence_rank,
+        imageProviderTag: model.image_provider_tag ?? null,
       };
     }
 
@@ -425,21 +449,21 @@ export function routeRequest(
   }
   if (modality === 'image_gen') {
     if (imageOps?.requireInpainting) {
-      const cnt = (db.prepare("SELECT COUNT(*) AS cnt FROM models WHERE enabled = 1 AND modality = 'image_gen' AND supports_inpainting = 1").get() as { cnt: number }).cnt;
+      const cnt = (db.prepare("SELECT COUNT(*) AS cnt FROM fallback_modality_config f JOIN models m ON m.id = f.model_db_id WHERE f.modality = 'image_gen' AND f.enabled = 1 AND m.image_gen_capable = 1 AND m.image_endpoint_available = 1 AND m.supports_inpainting = 1").get() as { cnt: number }).cnt;
       if (cnt === 0) {
         const err = new Error('No inpainting-capable models enabled (need supports_inpainting=1).') as any;
         err.status = 400;
         throw err;
       }
     } else if (imageOps?.requireImg2Img) {
-      const cnt = (db.prepare("SELECT COUNT(*) AS cnt FROM models WHERE enabled = 1 AND modality = 'image_gen' AND supports_img2img = 1").get() as { cnt: number }).cnt;
+      const cnt = (db.prepare("SELECT COUNT(*) AS cnt FROM fallback_modality_config f JOIN models m ON m.id = f.model_db_id WHERE f.modality = 'image_gen' AND f.enabled = 1 AND m.image_gen_capable = 1 AND m.image_endpoint_available = 1 AND m.supports_img2img = 1").get() as { cnt: number }).cnt;
       if (cnt === 0) {
         const err = new Error('No img2img-capable models enabled (need supports_img2img=1).') as any;
         err.status = 400;
         throw err;
       }
     } else {
-      const imageCount = (db.prepare("SELECT COUNT(*) AS cnt FROM models WHERE enabled = 1 AND modality = 'image_gen'").get() as { cnt: number }).cnt;
+      const imageCount = (db.prepare("SELECT COUNT(*) AS cnt FROM fallback_modality_config f JOIN models m ON m.id = f.model_db_id WHERE f.modality = 'image_gen' AND f.enabled = 1 AND m.image_gen_capable = 1 AND m.image_endpoint_available = 1").get() as { cnt: number }).cnt;
       if (imageCount === 0) {
         const err = new Error('No image-generation models enabled. Configure at least one (Cloudflare flux-1-schnell, sdxl-lightning, dreamshaper, sdxl-base, etc.).') as any;
         err.status = 400;
