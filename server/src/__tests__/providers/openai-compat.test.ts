@@ -115,6 +115,38 @@ describe('OpenAICompatProvider', () => {
       { modelId: 'vendor/free-image', priceClass: 'free', priceUsd: 0, providerTag: 'vendor/free', available: true },
       { modelId: 'vendor/paid-image', priceClass: 'paid', priceUsd: 0.04, providerTag: 'vendor/paid', available: true },
     ]);
+    expect(catalog[0].enabledByDefault).toBe(true);
+    expect(catalog[1].enabledByDefault).toBe(true);
+  });
+
+  it('auto-enables free image routes and only the six cheapest fixed-unit paid routes', async () => {
+    const openrouter = new OpenAICompatProvider({
+      platform: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1',
+    });
+    const models = [
+      ...Array.from({ length: 7 }, (_, i) => ({ id: `vendor/paid-${i + 1}`, price: 0.007 + i * 0.001, unit: 'image' })),
+      { id: 'vendor/token-cheap', price: 0.000001, unit: 'token' },
+      { id: 'vendor/free-image', price: 0, unit: 'image' },
+    ];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      const target = String(url);
+      if (target.endsWith('/images/models')) {
+        return new Response(JSON.stringify({ data: models.map(model => ({ id: model.id, name: model.id })) }));
+      }
+      const modelPath = target.split('/images/models/')[1]?.replace(/\/endpoints$/, '');
+      const model = models.find(item => item.id === modelPath)!;
+      return new Response(JSON.stringify({ endpoints: [{
+        provider_tag: 'vendor',
+        pricing: [{ billable: 'output_image', unit: model.unit, cost_usd: model.price }],
+      }] }));
+    });
+
+    const catalog = await openrouter.discoverImageModels();
+    const enabled = new Map(catalog.map(item => [item.modelId, item.enabledByDefault]));
+    expect(enabled.get('vendor/free-image')).toBe(true);
+    for (let i = 1; i <= 6; i++) expect(enabled.get(`vendor/paid-${i}`)).toBe(true);
+    expect(enabled.get('vendor/paid-7')).toBe(false);
+    expect(enabled.get('vendor/token-cheap')).toBe(false);
   });
 
   it('does not enable image generation for other OpenAI-compatible providers', async () => {

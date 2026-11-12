@@ -10,8 +10,44 @@ import {
   RoutingError,
   logRequest,
 } from './runChatCompletion.js';
+import { getProvider } from '../providers/index.js';
 
-const MAX_RETRIES = 8;
+const MAX_IMAGE_ROUTE_ATTEMPTS = 512;
+
+/**
+ * Image fallback must be able to traverse the full enabled plan (and each
+ * configured key for keyed providers). Unlike chat, image plans are explicitly
+ * ordered free-first and may contain more than eight free candidates.
+ */
+export function getImageRouteAttemptLimit(): number {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT m.platform, COUNT(*) AS model_count
+    FROM fallback_modality_config fc
+    JOIN models m ON m.id = fc.model_db_id
+    WHERE fc.modality = 'image_gen' AND fc.enabled = 1
+      AND m.image_gen_capable = 1 AND m.image_endpoint_available = 1
+    GROUP BY m.platform
+  `).all() as Array<{ platform: string; model_count: number }>;
+  const keyCountStmt = db.prepare(`
+    SELECT COUNT(*) AS count FROM api_keys
+    WHERE platform = ? AND enabled = 1 AND status != 'invalid'
+  `);
+
+  let candidates = 0;
+  for (const row of rows) {
+    const provider = getProvider(row.platform as any);
+    if (!provider) continue;
+    if (!provider.requiresApiKey) {
+      candidates += row.model_count;
+      continue;
+    }
+    const keyCount = (keyCountStmt.get(row.platform) as { count: number }).count;
+    candidates += row.model_count * keyCount;
+  }
+
+  return Math.max(1, Math.min(candidates, MAX_IMAGE_ROUTE_ATTEMPTS));
+}
 
 // ---- Schema ----
 
@@ -79,8 +115,9 @@ export async function runImageGeneration(parsed: ImageGenerationRequest): Promis
 
   const skipKeys = new Set<string>();
   let lastError: Error | null = null;
+  const maxAttempts = getImageRouteAttemptLimit();
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult;
     try {
       route = routeRequest(estimatedNeurons, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, false, false, 'image_gen');
@@ -168,7 +205,7 @@ export async function runImageGeneration(parsed: ImageGenerationRequest): Promis
         }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[ImageGen] ${err.message.slice(0, 60)} from ${route.displayName} (${reason}), falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[ImageGen] ${err.message.slice(0, 60)} from ${route.displayName} (${reason}), falling back (attempt ${attempt + 1}/${maxAttempts})`);
         continue;
       }
 

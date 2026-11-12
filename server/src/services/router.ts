@@ -24,6 +24,8 @@ interface ModelRow {
   supports_inpainting?: number;
   image_gen_capable?: number;
   image_cost_class?: string;
+  image_cost_usd?: number | null;
+  image_cost_unit?: string | null;
   image_endpoint_available?: number;
   image_provider_tag?: string | null;
 }
@@ -292,17 +294,37 @@ export function routeRequest(
   }
 
   // Free image routes (including free quotas) always precede known paid
-  // endpoints. Manual pinning is the only way to bypass this policy. UI
-  // priority controls quality/order *within* each price tier.
+  // endpoints. Free non-OpenRouter providers run first, then any free OpenRouter
+  // image routes. Paid routes with per-image/per-megapixel pricing are sorted by
+  // their approximate cost for a standard ~1MP output. Token/request pricing is
+  // kept in separate comparable groups because its total cost per image varies.
+  // Manual pinning is the only way to bypass this automatic policy.
   if (modality === 'image_gen' && preferredModelDbId === undefined) {
-    const imagePricing = new Map((db.prepare('SELECT id, image_cost_class FROM models').all() as
-      Array<{ id: number; image_cost_class: string }>).map(m => [m.id, m.image_cost_class]));
-    const imageTier = (id: number) => {
-      const priceClass = imagePricing.get(id);
-      return priceClass === 'free' ? 0 : priceClass === 'paid' ? 1 : 2;
+    const imagePricing = new Map((db.prepare(
+      'SELECT id, platform, image_cost_class, image_cost_usd, image_cost_unit FROM models'
+    ).all() as Array<{ id: number; platform: string; image_cost_class: string; image_cost_usd: number | null; image_cost_unit: string | null }>)
+      .map(m => [m.id, m]));
+    const imageOrderGroup = (id: number) => {
+      const model = imagePricing.get(id);
+      if (model?.image_cost_class === 'free') return model.platform === 'openrouter' ? 1 : 0;
+      if (model?.image_cost_class !== 'paid') return 6;
+      const unit = (model.image_cost_unit ?? '').toLowerCase();
+      if (unit === 'image' || unit === 'megapixel') return 2;
+      if (unit === 'token') return 3;
+      if (unit === 'request') return 4;
+      return 5;
     };
-    sortedChain.sort((a, b) => imageTier(a.model_db_id) - imageTier(b.model_db_id)
-      || a.effectivePriority - b.effectivePriority);
+    sortedChain.sort((a, b) => {
+      const orderA = imageOrderGroup(a.model_db_id);
+      const orderB = imageOrderGroup(b.model_db_id);
+      if (orderA !== orderB) return orderA - orderB;
+      if (orderA >= 2 && orderA <= 4) {
+        const priceA = imagePricing.get(a.model_db_id)?.image_cost_usd;
+        const priceB = imagePricing.get(b.model_db_id)?.image_cost_usd;
+        if (priceA != null && priceB != null && priceA !== priceB) return priceA - priceB;
+      }
+      return a.effectivePriority - b.effectivePriority;
+    });
   }
 
   for (const entry of sortedChain) {

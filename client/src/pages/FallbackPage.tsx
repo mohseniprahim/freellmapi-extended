@@ -66,7 +66,33 @@ const PLAN_LABELS: Record<PlanName, { title: string; description: string }> = {
   image_gen: { title: 'Image generation', description: 'توليد الصور: المجاني أولاً ثم المدفوع' },
 }
 
-const imageTier = (entry: FallbackEntry) => entry.imageCostClass === 'free' ? 0 : entry.imageCostClass === 'paid' ? 1 : 2
+const imageOrderGroup = (entry: FallbackEntry) => {
+  if (entry.imageCostClass === 'free') return entry.platform === 'openrouter' ? 1 : 0
+  if (entry.imageCostClass !== 'paid') return 6
+  const unit = (entry.imageCostUnit ?? '').toLowerCase()
+  if (unit === 'image' || unit === 'megapixel') return 2
+  if (unit === 'token') return 3
+  if (unit === 'request') return 4
+  return 5
+}
+
+const imageOrder = (a: FallbackEntry, b: FallbackEntry) => {
+  const groupA = imageOrderGroup(a)
+  const groupDiff = groupA - imageOrderGroup(b)
+  if (groupDiff) return groupDiff
+  if (groupA >= 2 && groupA <= 4
+      && a.imageCostUsd != null && b.imageCostUsd != null && a.imageCostUsd !== b.imageCostUsd) {
+    return a.imageCostUsd - b.imageCostUsd
+  }
+  return a.priority - b.priority
+}
+
+const imageDragGroup = (entry: FallbackEntry) => {
+  const group = imageOrderGroup(entry)
+  return group >= 2 && group <= 4
+    ? `${group}:${entry.imageCostUsd ?? 'unknown'}`
+    : String(group)
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
@@ -374,7 +400,7 @@ export default function FallbackPage() {
 
   const sourceEntries = localPlans?.[activePlan] ?? plans?.[activePlan] ?? []
   const allEntries = activePlan === 'image_gen'
-    ? [...sourceEntries].sort((a, b) => imageTier(a) - imageTier(b) || a.priority - b.priority)
+    ? [...sourceEntries].sort(imageOrder)
     : sourceEntries
   // Never hide catalog rows just because a provider key is missing. Paid
   // OpenRouter models must remain visible so the operator can configure them.
@@ -391,7 +417,7 @@ export default function FallbackPage() {
     if (!over || active.id === over.id) return
     const oldIndex = displayEntries.findIndex(e => e.modelDbId === active.id)
     const newIndex = displayEntries.findIndex(e => e.modelDbId === over.id)
-    if (activePlan === 'image_gen' && imageTier(displayEntries[oldIndex]) !== imageTier(displayEntries[newIndex])) return
+    if (activePlan === 'image_gen' && imageDragGroup(displayEntries[oldIndex]) !== imageDragGroup(displayEntries[newIndex])) return
     const reorderedVisible = arrayMove(displayEntries, oldIndex, newIndex)
     // displayEntries currently contains the complete catalog, including rows
     // without configured keys. Appending those rows again creates duplicate
@@ -410,7 +436,7 @@ export default function FallbackPage() {
     const index = allEntries.findIndex(e => e.modelDbId === modelDbId)
     const nextIndex = direction === 'up' ? index - 1 : index + 1
     if (index < 0 || nextIndex < 0 || nextIndex >= allEntries.length) return
-    if (activePlan === 'image_gen' && imageTier(allEntries[index]) !== imageTier(allEntries[nextIndex])) return
+    if (activePlan === 'image_gen' && imageDragGroup(allEntries[index]) !== imageDragGroup(allEntries[nextIndex])) return
     const reordered = arrayMove(allEntries, index, nextIndex)
     setLocalPlans({ ...(localPlans ?? {}), [activePlan]: reordered.map((entry, i) => ({ ...entry, priority: i + 1 })) })
   }
@@ -464,7 +490,7 @@ export default function FallbackPage() {
         <div className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground">
           ترتيب وتفعيل خطة <strong className="text-foreground">{PLAN_LABELS[activePlan].title}</strong> مستقل عن الخطط الأخرى. يمكن استخدام النموذج نفسه في أكثر من خطة.
         </div>
-        {activePlan === 'image_gen' && <div className="text-xs text-muted-foreground">سيتم تجربة النماذج المجانية أولًا تلقائيًا، حتى لو كان ترتيب نموذج مدفوع أعلى. يُستخدم المدفوع بعد تعذّر المجاني. يمكنك إعادة ترتيب النماذج داخل كل فئة سعرية فقط.</div>}
+        {activePlan === 'image_gen' && <div className="text-xs text-muted-foreground">تُجرَّب النماذج المجانية أولًا، ثم النماذج المدفوعة ذات السعر المباشر للصورة/الميغابكسل من الأرخص إلى الأعلى. أسعار token والطلب في مجموعات منفصلة لأن تكلفتها النهائية لكل صورة متغيرة. لا يؤثر ترتيب النص على هذه الخطة.</div>}
         {activePlan === 'image_gen' && imageSyncMessage && <div role="status" className="text-sm text-muted-foreground">{imageSyncMessage}</div>}
         {/* TEXT modality — monthly + daily token budgets */}
         {tokenUsage && tokenUsage.totalBudget > 0 && (

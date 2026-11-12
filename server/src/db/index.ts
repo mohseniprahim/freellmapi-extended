@@ -123,6 +123,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV57BalancedRerank(db);
   migrateModelsV65OpenRouterImage(db);
   migrateImageFallbackPlanV66(db);
+  migrateImageFallbackPriceDefaultsV67(db);
 
   // Older deployments regenerated settings.unified_api_key without updating
   // client_keys. Backfill the current value once per missing hash so existing
@@ -238,6 +239,32 @@ function migrateImageFallbackPlanV66(db: Database.Database) {
       insert.run(row.id, index + 1, enabled ? 1 : 0);
     });
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_v66_image_plan', 'done')").run();
+  })();
+}
+
+/** V67: make a bounded, predictable OpenRouter paid fallback available after
+ *  free routes. Only the six lowest directly-priced image/megapixel endpoints
+ *  are auto-enabled; token-priced and unknown-cost models remain opt-in. */
+function migrateImageFallbackPriceDefaultsV67(db: Database.Database) {
+  const migrated = db.prepare("SELECT value FROM settings WHERE key = 'migration_v67_image_price_defaults'").get() as { value: string } | undefined;
+  if (migrated?.value === 'done') return;
+
+  const candidates = db.prepare(`
+    SELECT m.id
+    FROM models m
+    JOIN fallback_modality_config fc ON fc.model_db_id = m.id AND fc.modality = 'image_gen'
+    WHERE m.platform = 'openrouter'
+      AND m.image_gen_capable = 1 AND m.image_endpoint_available = 1
+      AND m.image_cost_class = 'paid'
+      AND m.image_cost_unit IN ('image', 'megapixel')
+      AND m.image_cost_usd > 0
+    ORDER BY m.image_cost_usd ASC, m.id ASC
+    LIMIT 6
+  `).all() as Array<{ id: number }>;
+  const enable = db.prepare("UPDATE fallback_modality_config SET enabled = 1 WHERE modality = 'image_gen' AND model_db_id = ?");
+  db.transaction(() => {
+    candidates.forEach(model => enable.run(model.id));
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_v67_image_price_defaults', 'done')").run();
   })();
 }
 

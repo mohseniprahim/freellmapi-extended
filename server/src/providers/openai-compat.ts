@@ -233,8 +233,8 @@ export class OpenAICompatProvider extends BaseProvider {
             priceUnit: selected?.unit ?? null,
             providerTag: selected?.tag ?? null,
             available,
-            // Keep one tested paid fallback active; additional paid/unknown
-            // models are discoverable but require explicit operator enablement.
+            // Preserve the legacy Qwen fallback; the catalog-wide pass below
+            // enables the six cheapest known per-image/per-megapixel routes.
             enabledByDefault: model.id === 'qwen/qwen-image-2.1-turbo' && available,
           };
         } catch {
@@ -245,7 +245,20 @@ export class OpenAICompatProvider extends BaseProvider {
       }
     };
     await Promise.all(Array.from({ length: Math.min(6, catalog.length) }, () => worker()));
-    return results.filter((item): item is ImageModelCatalogItem => item !== undefined);
+    const discovered = results.filter((item): item is ImageModelCatalogItem => item !== undefined);
+    const cheapestDirectPaid = new Set(discovered
+      .filter(item => item.available && item.priceClass === 'paid'
+        && item.priceUsd != null && item.priceUsd > 0
+        && (item.priceUnit === 'image' || item.priceUnit === 'megapixel'))
+      .sort((a, b) => (a.priceUsd ?? Number.MAX_SAFE_INTEGER) - (b.priceUsd ?? Number.MAX_SAFE_INTEGER)
+        || a.modelId.localeCompare(b.modelId))
+      .slice(0, 6)
+      .map(item => item.modelId));
+    return discovered.map(item => ({
+      ...item,
+      enabledByDefault: item.available && (item.priceClass === 'free'
+        || item.enabledByDefault === true || cheapestDirectPaid.has(item.modelId)),
+    }));
   }
 
   /**
